@@ -1,0 +1,24 @@
+name: hazard-backfill
+on:
+  schedule:
+    - cron: "10 */2 * * *"    # every 2 hours until 4 years complete
+  workflow_dispatch:
+    inputs:
+      time_budget_min: {description: "minutes", default: "100"}
+jobs:
+  walk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    concurrency: {group: hazard-backfill, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libeccodes-dev
+      - run: pip install numpy pygrib requests
+      - env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '100' }}
+        run: python hazard_backfill_walker.py
