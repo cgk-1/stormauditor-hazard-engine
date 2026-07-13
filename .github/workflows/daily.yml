@@ -1,13 +1,13 @@
-name: hazard-daily
+name: hazard-v2-daily
 on:
   schedule:
-    - cron: "40 9 * * *"      # after 06Z day closes + URMA delay
+    - cron: "50 9 * * *"       # after all CONUS local days close + HRRR delay
   workflow_dispatch:
     inputs:
-      ingest_date: {description: "YYYYMMDD or a:b range", required: false}
+      ingest_date: {description: "local YYYYMMDD or a:b range", required: false}
       tasks: {description: "obs tasks", default: "dailies,lsr"}
 jobs:
-  wind:
+  hrrr:
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
@@ -15,14 +15,13 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - run: sudo apt-get update -q && sudo apt-get install -y -q libeccodes-dev
-      - run: pip install numpy pygrib requests
-      - name: National wind layers (ANL + HRRR)
-        env:
+      - run: pip install numpy pygrib shapely requests
+      - env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
           INGEST_DATE: ${{ github.event.inputs.ingest_date }}
-        run: python hazard_wind_ingest.py
+        run: python hz_hrrr_ingest.py
   obs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -31,8 +30,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - run: pip install numpy requests
-      - name: Observation layers (station dailies + LSR)
-        env:
+      - env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
