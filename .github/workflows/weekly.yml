@@ -1,10 +1,10 @@
-name: hazard-weekly
+name: hazard-v2-weekly
 on:
   schedule:
-    - cron: "20 7 * * 1"      # Mondays: stations + NCEI + HURDAT refresh
+    - cron: "20 7 * * 1"
   workflow_dispatch:
     inputs:
-      ncei_years: {description: "e.g. 2022,2023,2024,2025,2026", required: false}
+      ncei_years: {description: "e.g. 2024,2025,2026", required: false}
 jobs:
   refresh:
     runs-on: ubuntu-latest
