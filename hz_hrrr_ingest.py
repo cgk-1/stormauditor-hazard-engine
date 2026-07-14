@@ -257,7 +257,10 @@ def process_local_date(local_date, states, base, anon, secret):
             continue
         la, lo = _LATLON
         ys, xs = np.where(dmax >= FLOOR)
-        cand = list(zip(ys.tolist(), xs.tolist()))
+        # vectorized candidate arrays (per-state bbox filtering in numpy,
+        # shapely only on the survivors -- ~50x faster than the python loop)
+        c_lon = lo[ys, xs]; c_lat = la[ys, xs]
+        c_v = dmax[ys, xs]; c_d40 = d40[ys, xs]; c_d58 = d58[ys, xs]
         # station backgrounds for stations whose state tz is this group
         bg_rows = []
         gset = {NAME2ABBR[s] for s in group_states}
@@ -278,15 +281,16 @@ def process_local_date(local_date, states, base, anon, secret):
             try:
                 geom, pg = load_state_geom(st)
                 minx, miny, maxx, maxy = geom.bounds
+                m = ((c_lon >= minx) & (c_lon <= maxx) &
+                     (c_lat >= miny) & (c_lat <= maxy))
                 pts = []
-                for yy, xx in cand:
-                    x, y = float(lo[yy, xx]), float(la[yy, xx])
-                    if minx <= x <= maxx and miny <= y <= maxy and \
-                       pg.contains(Point(x, y)):
+                for i in np.where(m)[0]:
+                    x, y = float(c_lon[i]), float(c_lat[i])
+                    if pg.contains(Point(x, y)):
                         pts.append({"lon": round(x, 3), "lat": round(y, 3),
-                                    "v": int(round(float(dmax[yy, xx]))),
-                                    "d40": int(d40[yy, xx]),
-                                    "d58": int(d58[yy, xx])})
+                                    "v": int(round(float(c_v[i]))),
+                                    "d40": int(c_d40[i]),
+                                    "d58": int(c_d58[i])})
                 if not pts:
                     continue
                 for i in range(0, len(pts), 4000):
