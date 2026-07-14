@@ -122,7 +122,8 @@ def task_dailies(base, anon, secret, d0, d1):
                     mph = float(p[2]) * KT2MPH
                 except ValueError:
                     continue
-                if mph >= 20:
+                if mph >= 3:   # store the full field: low gusts are
+                               # valid OA evidence (they temper hot backgrounds)
                     rows.append({"stid": p[0], "date": p[1],
                                  "gust_mph": round(mph, 1)})
         except Exception as e:
@@ -132,7 +133,7 @@ def task_dailies(base, anon, secret, d0, d1):
         rpc(base, anon, "hz_station_daily_ingest",
             {"p_secret": secret, "p_d0": d0.isoformat(), "p_d1": d1.isoformat(),
              "p_rows": ch, "p_append": i > 0})
-    print(f"dailies {d0}..{d1}: {len(rows)} station-day gusts >= 20 mph")
+    print(f"dailies {d0}..{d1}: {len(rows)} station-day gusts stored (full field, >= 3 mph)")
 
 
 # ----------------------------------------------------------------------- lsr
