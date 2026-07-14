@@ -34,7 +34,7 @@ from shapely.prepared import prep
 UA = {"User-Agent": "StormAuditor-HazardEngine/2.0"}
 UTC = dt.timezone.utc
 MS2MPH = 2.2369363
-FLOOR = float(os.environ.get("FLOOR_MPH", "40"))
+FLOOR = float(os.environ.get("FLOOR_MPH", "30"))
 HRRR = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
 
 STATE_TZ = {
@@ -111,48 +111,72 @@ _HOUR_CACHE = {}   # utc iso-hour -> np.array (m/s) | None
 _LATLON = None
 
 
-def hrrr_hour(t):
-    """HRRR f00 surface GUST for one UTC hour (m/s), cached across tz groups."""
+def _fetch_field(stem, field, want_max_lvl):
+    """Byte-range one GRIB message; returns m/s array or None."""
     global _LATLON
+    try:
+        idx = urllib.request.urlopen(
+            urllib.request.Request(f"{HRRR}/{stem}.idx", headers=UA),
+            timeout=45).read().decode().splitlines()
+        s = e = None
+        for i, line in enumerate(idx):
+            f = line.split(":")
+            if len(f) > 4 and f[3] == field and want_max_lvl in line:
+                s = int(f[1])
+                e = int(idx[i+1].split(":")[1]) - 1 if i+1 < len(idx) else ""
+                break
+        if s is None:
+            return None
+        blob = urllib.request.urlopen(urllib.request.Request(
+            f"{HRRR}/{stem}", headers={**UA, "Range": f"bytes={s}-{e}"}),
+            timeout=120).read()
+        with open("/tmp/_h.grib2", "wb") as fh:
+            fh.write(blob)
+        g = pygrib.open("/tmp/_h.grib2")
+        m = g[1]
+        arr = np.asarray(m.values, dtype="float32")
+        if _LATLON is None:
+            la, lo = m.latlons()
+            lo = np.asarray(lo)
+            _LATLON = (np.asarray(la, dtype="float32"),
+                       np.where(lo > 180, lo - 360.0, lo).astype("float32"))
+        g.close()
+        return arr
+    except Exception:
+        return None
+
+
+def hrrr_hour(t):
+    """HRRR near-surface wind proxy for the hour ENDING at t (m/s):
+    elementwise max of the f01 hourly-maximum 10 m wind (the Kain et al.
+    2010 hourly-maximum-field diagnostic, which captures sub-hourly
+    convective peaks the instantaneous analysis misses) and the f01 GUST.
+    Taking the max is a floor relationship (gust >= sustained maximum), so
+    no conversion coefficient is introduced. Cached across tz groups."""
     key = t.strftime("%Y%m%d%H")
     if key in _HOUR_CACHE:
         return _HOUR_CACHE[key]
-    ds, hh = t.strftime("%Y%m%d"), t.hour
-    stem = f"hrrr.{ds}/conus/hrrr.t{hh:02d}z.wrfsfcf00.grib2"
+    init = t - dt.timedelta(hours=1)          # f01 valid at t
+    ds, hh = init.strftime("%Y%m%d"), init.hour
+    stem = f"hrrr.{ds}/conus/hrrr.t{hh:02d}z.wrfsfcf01.grib2"
     arr = None
     for attempt in range(3):
-        try:
-            idx = urllib.request.urlopen(
-                urllib.request.Request(f"{HRRR}/{stem}.idx", headers=UA),
-                timeout=45).read().decode().splitlines()
-            s = e = None
-            for i, line in enumerate(idx):
-                f = line.split(":")
-                if len(f) > 3 and f[3] == "GUST":
-                    s = int(f[1])
-                    e = int(idx[i+1].split(":")[1]) - 1 if i+1 < len(idx) else ""
-                    break
-            if s is None:
-                break
-            blob = urllib.request.urlopen(urllib.request.Request(
-                f"{HRRR}/{stem}", headers={**UA, "Range": f"bytes={s}-{e}"}),
-                timeout=120).read()
-            with open("/tmp/_h.grib2", "wb") as fh:
-                fh.write(blob)
-            g = pygrib.open("/tmp/_h.grib2")
-            m = g[1]
-            arr = np.asarray(m.values, dtype="float32")
-            if _LATLON is None:
-                la, lo = m.latlons()
-                lo = np.asarray(lo)
-                _LATLON = (np.asarray(la, dtype="float32"),
-                           np.where(lo > 180, lo - 360.0, lo).astype("float32"))
-            g.close()
+        wm = _fetch_field(stem, "WIND", "0-1 hour max")
+        gu = _fetch_field(stem, "GUST", "1 hour fcst")
+        if wm is not None or gu is not None:
+            if wm is None:
+                arr = gu
+            elif gu is None or gu.shape != wm.shape:
+                arr = wm
+            else:
+                arr = np.fmax(wm, gu)
             break
-        except Exception:
-            time.sleep(2 * (attempt + 1))
+        time.sleep(2 * (attempt + 1))
+    if arr is None:   # last resort: f00 instantaneous gust
+        stem0 = f"hrrr.{t.strftime('%Y%m%d')}/conus/hrrr.t{t.hour:02d}z.wrfsfcf00.grib2"
+        arr = _fetch_field(stem0, "GUST", "anl")
     _HOUR_CACHE[key] = arr
-    if len(_HOUR_CACHE) > 40:   # keep memory bounded on multi-date runs
+    if len(_HOUR_CACHE) > 40:
         for k in sorted(_HOUR_CACHE)[:8]:
             _HOUR_CACHE.pop(k, None)
     return arr
