@@ -21,4 +21,5 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
           TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '100' }}
+          FLOOR_MPH: "35"
         run: python hz_backfill_hrrr.py
