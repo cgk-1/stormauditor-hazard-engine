@@ -23,6 +23,7 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
           INGEST_DATE: ${{ github.event.inputs.ingest_date }}
+          FLOOR_MPH: "35"
         run: python hz_hrrr_ingest.py
   obs:
     runs-on: ubuntu-latest
