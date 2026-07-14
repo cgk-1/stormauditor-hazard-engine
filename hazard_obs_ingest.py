@@ -109,7 +109,7 @@ def task_stations(base, anon, secret):
 def task_dailies(base, anon, secret, d0, d1):
     rows = []
     for st in CONUS:
-        url = (f"{IEM}/cgi-bin/request/daily.py?network={st}_ASOS"
+        url = (f"{IEM}/cgi-bin/request/daily.py?network={st}_ASOS&stations=_ALL"
                f"&year1={d0.year}&month1={d0.month}&day1={d0.day}"
                f"&year2={d1.year}&month2={d1.month}&day2={d1.day}"
                f"&var=max_wind_gust_kts&format=csv&na=blank")
