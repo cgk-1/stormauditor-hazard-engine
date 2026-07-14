@@ -6,8 +6,10 @@ on:
     inputs:
       ingest_date: {description: "local YYYYMMDD or a:b range", required: false}
       tasks: {description: "obs tasks", default: "dailies,lsr"}
+      run_hrrr: {description: "run the HRRR job (set false for obs-only)", default: "true"}
 jobs:
   hrrr:
+    if: ${{ github.event.inputs.run_hrrr != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
