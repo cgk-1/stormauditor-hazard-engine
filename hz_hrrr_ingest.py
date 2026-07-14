@@ -256,6 +256,11 @@ def process_local_date(local_date, states, base, anon, secret):
             print(f"  {date_iso} [{tzname}]: no HRRR data")
             continue
         la, lo = _LATLON
+        # v2.6: uncapped coarse field samples (every 8th cell, >=5 mph)
+        cg_v = dmax[::8, ::8]; cg_la = la[::8, ::8]; cg_lo = lo[::8, ::8]
+        cyy, cxx = np.where(cg_v >= 5)
+        cg_lonv = cg_lo[cyy, cxx]; cg_latv = cg_la[cyy, cxx]
+        cg_vv = cg_v[cyy, cxx]
         ys, xs = np.where(dmax >= FLOOR)
         # vectorized candidate arrays (per-state bbox filtering in numpy,
         # shapely only on the survivors -- ~50x faster than the python loop)
@@ -291,6 +296,19 @@ def process_local_date(local_date, states, base, anon, secret):
                                     "v": int(round(float(c_v[i]))),
                                     "d40": int(c_d40[i]),
                                     "d58": int(c_d58[i])})
+                # coarse field samples for this state (uncapped)
+                cm = ((cg_lonv >= minx) & (cg_lonv <= maxx) &
+                      (cg_latv >= miny) & (cg_latv <= maxy))
+                cpts = [{"lon": round(float(cg_lonv[i]), 2),
+                         "lat": round(float(cg_latv[i]), 2),
+                         "v": int(round(float(cg_vv[i])))}
+                        for i in np.where(cm)[0]
+                        if pg.contains(Point(float(cg_lonv[i]),
+                                             float(cg_latv[i])))]
+                for i in range(0, len(cpts), 4000):
+                    rpc(base, anon, "hz_bg_coarse_ingest",
+                        {"p_secret": secret, "p_date": date_iso,
+                         "p_src": "HRRR", "p_points": cpts[i:i+4000]})
                 if not pts:
                     continue
                 for i in range(0, len(pts), 4000):
