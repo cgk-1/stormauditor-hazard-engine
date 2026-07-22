@@ -1,3 +1,18 @@
+> **METHOD UPDATE (engine 2.12, July 2026).** The per-address estimator has
+> been upgraded from the SAWE-1 heuristic described below to **SAWE-2**, a
+> two-pass successive-correction objective analysis (Cressman 1959; Barnes
+> 1964; Koch, desJardins & Kocin 1983): background = NWS analysis of record
+> at the property (HRRR fallback), correction = Gaussian-weighted mean of
+> measured-observation innovations (w0 = 0.25 convective / 1.0 synoptic,
+> length scale 10 km convective / 50 km synoptic), one-sided and capped at
+> the largest observed innovation; estimate = greatest(local analysis,
+> regional field + correction). Hail is **SAHE-2** (MESH primary, ground
+> reports reconcile occurrence, size capped at the 3-mi MESH max). 2.12 also
+> fixes a haversine defect that had prevented hail ground-report
+> reconciliation from ever matching. Authoritative definitions live in the
+> `property_hazard_report`, `hz_explain_wind`, and `hz_explain_hail`
+> functions and on stormauditor.com/methodology/wind and /methodology/hail.
+
 # StormAuditor HAZARD ENGINE — architecture & setup
 
 ## What this is
