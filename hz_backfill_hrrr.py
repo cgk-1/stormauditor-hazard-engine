@@ -33,7 +33,7 @@ def main():
         if os.environ.get("END_DATE") else today - dt.timedelta(days=1)
     start = dt.datetime.strptime(os.environ["START_DATE"], "%Y%m%d").date() \
         if os.environ.get("START_DATE") else today - dt.timedelta(days=730)
-    cur = rpc(base, anon, "hz_backfill_get", {"p_key": "hzhrrr"})
+    cur = rpc(base, anon, "hz_backfill_get", {"p_key": "hzhrrr", "p_secret": secret})
     cursor = dt.datetime.strptime(cur, "%Y-%m-%d").date() if cur \
         else end + dt.timedelta(days=1)
     states = sorted(hz.PERMITTED_STATES)
