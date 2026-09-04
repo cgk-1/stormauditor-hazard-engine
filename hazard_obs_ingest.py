@@ -40,8 +40,11 @@ CONUS = ["AL","AZ","AR","CA","CO","CT","DE","FL","GA","ID","IL","IN","IA","KS",
          "VT","VA","WA","WV","WI","WY","DC"]
 
 LSR_WIND = {"TSTM WND GST","TSTM WND DMG","NON-TSTM WND GST","NON-TSTM WND DMG",
-            "HIGH WIND","HURRICANE","TROPICAL STORM","DOWNBURST","MICROBURST",
-            "TORNADO"}
+            "HIGH WIND","HIGH SUST WINDS","MARINE TSTM WIND","HURRICANE",
+            "TROPICAL STORM","DOWNBURST","MICROBURST","TORNADO"}
+# 2026-09-04: MARINE TSTM WIND = measured buoy/C-MAN coastal gusts (real
+# 2-letter states, lat/lon, QUALIFIER=M) — previously dropped. HIGH SUST
+# WINDS is IEM's actual typetext ("HIGH WIND" never matched upstream).
 LSR_HAIL = {"HAIL"}
 NCEI_TYPES = {"Thunderstorm Wind":"wind","High Wind":"wind","Marine Thunderstorm Wind":"wind",
               "Hail":"hail","Marine Hail":"hail","Tornado":"wind",
@@ -138,8 +141,14 @@ def task_dailies(base, anon, secret, d0, d1):
 
 # ----------------------------------------------------------------------- lsr
 def task_lsr(base, anon, secret, d0, d1):
+    # 2026-09-04: fetch through d1+1 09:00Z (covers Pacific + margin) so the
+    # end day's local EVENING rows are in this run's payload; hz_lsr_ingest
+    # now deletes exactly [d0, d1] and keeps only rows whose state-local date
+    # is in that range. (The old pairing deleted [d0-1, d1] but fetched from
+    # d0 00:00Z — every nightly run destroyed the previous local day's
+    # daytime reports.)
     url = (f"{IEM}/cgi-bin/request/gis/lsr.py?sts={d0:%Y-%m-%d}T00:00Z"
-           f"&ets={d1:%Y-%m-%d}T23:59Z&fmt=csv")
+           f"&ets={d1 + dt.timedelta(days=1):%Y-%m-%d}T09:00Z&fmt=csv")
     rows = []
     try:
         rdr = csv.reader(io.StringIO(_get(url, timeout=600)))
