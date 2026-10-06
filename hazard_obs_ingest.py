@@ -7,6 +7,8 @@ model-only, mirroring what commercial suites bundle. All tiny compared to the
 grids; each nightly run is a few MB.
 
   STATIONS  ASOS/AWOS station metadata for all CONUS state networks (weekly).
+  PEAKS     WHEN each station's peak gust happened (local day, >= 25 mph) ->
+            hz_station_peak (station_peaks.py; 2026-10-06, report time data).
   DAILIES   Per-station daily peak wind gust (mph) for the target date(s) —
             the "nearest measured gust" layer (nightly; range mode for backfill:
             one request per network per year).
@@ -18,7 +20,7 @@ grids; each nightly run is a few MB.
   HURDAT2   NHC Atlantic best track — tropical-day flagging (seasonal).
 
 Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
-Task selection: TASKS=stations,dailies,lsr,ncei,hurdat (default: dailies,lsr)
+Task selection: TASKS=stations,dailies,peaks,lsr,ncei,hurdat (default: dailies,peaks,lsr)
   DAILIES/LSR:  INGEST_DATE  YYYYMMDD | a:b range   (default yesterday UTC)
   NCEI:         NCEI_YEARS   e.g. "2022,2023,2024"  (default current year)
 Deps: numpy requests
@@ -139,6 +141,30 @@ def task_dailies(base, anon, secret, d0, d1):
     print(f"dailies {d0}..{d1}: {len(rows)} station-day gusts stored (full field, >= 3 mph)")
 
 
+# --------------------------------------------------------------------- peaks
+def task_peaks(base, anon, secret, d0, d1):
+    """Station peak-gust TIME per local day (station_peaks.py) for the same
+    dates as the dailies -> hz_station_peak. Separate table: the dailies'
+    delete/re-insert never touches it. One METAR request per network per day."""
+    import station_peaks as SP
+    n = 0
+    day = d0
+    while day <= d1:
+        rows = []
+        for st in CONUS:
+            try:
+                rows += SP.peaks_for_day(st, day)
+            except Exception as e:
+                print(f"  [warn] peaks {st} {day}: {e}")
+            time.sleep(0.3)
+        for _, ch in _chunks(rows, 2000):
+            rpc(base, anon, "hz_station_peak_ingest", {"p_secret": secret, "p_rows": ch})
+        n += len(rows)
+        print(f"peaks {day}: {len(rows)} station-days >= {SP.MIN_MPH:g} mph with peak time")
+        day += dt.timedelta(days=1)
+    print(f"peaks {d0}..{d1}: {n} rows")
+
+
 # ----------------------------------------------------------------------- lsr
 def task_lsr(base, anon, secret, d0, d1):
     # 2026-09-04: fetch through d1+1 09:00Z (covers Pacific + margin) so the
@@ -255,7 +281,7 @@ def main():
     base = os.environ["SUPABASE_URL"].rstrip("/")
     anon = os.environ["SUPABASE_ANON_KEY"]
     secret = os.environ["INGEST_SECRET"]
-    tasks = (os.environ.get("TASKS") or "dailies,lsr").split(",")
+    tasks = (os.environ.get("TASKS") or "dailies,peaks,lsr").split(",")
     raw = os.environ.get("INGEST_DATE") or \
         (dt.datetime.now(UTC).date() - dt.timedelta(days=1)).strftime("%Y%m%d")
     if ":" in raw:
@@ -269,6 +295,8 @@ def main():
         task_stations(base, anon, secret)
     if "dailies" in tasks:
         task_dailies(base, anon, secret, d0, d1)
+    if "peaks" in tasks:
+        task_peaks(base, anon, secret, d0, d1)
     if "lsr" in tasks:
         task_lsr(base, anon, secret, d0, d1)
     if "ncei" in tasks:
