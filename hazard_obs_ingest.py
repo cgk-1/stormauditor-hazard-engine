@@ -296,7 +296,10 @@ def main():
     if "dailies" in tasks:
         task_dailies(base, anon, secret, d0, d1)
     if "peaks" in tasks:
-        task_peaks(base, anon, secret, d0, d1)
+        try:   # peak times are an add-on: never let them block the lsr task
+            task_peaks(base, anon, secret, d0, d1)
+        except Exception as e:
+            print(f"  [warn] peaks task failed: {e}")
     if "lsr" in tasks:
         task_lsr(base, anon, secret, d0, d1)
     if "ncei" in tasks:
