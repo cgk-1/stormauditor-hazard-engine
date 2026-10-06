@@ -113,4 +113,7 @@ def peaks_from_csv(text: str, day: dt.date, tzmap: dict[str, str], min_mph: floa
 
 
 def peaks_for_day(state: str, day: dt.date, min_mph: float = MIN_MPH) -> list[dict]:
-    return peaks_from_csv(fetch_metars(state, day), day, station_tz(state), min_mph)
+    tz = station_tz(state)
+    if not tz:   # empty IEM network (e.g. DC: DCA is in VA_ASOS) -> IEM reads it as an all-stations request (HTTP 400)
+        return []
+    return peaks_from_csv(fetch_metars(state, day), day, tz, min_mph)
