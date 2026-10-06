@@ -10,7 +10,8 @@ the station's METARs from IEM asos.py and finds WHEN the peak happened:
   A PK WND issued after midnight for a gust before midnight belongs to the
   day the gust HAPPENED (event-time bucketing).
   wind_hours = local clock hours of D with at least one wind observation
-  (coverage: < 24 means gaps in the record).
+  (coverage: < 24 means gaps in the record). tz = the station's IANA zone,
+  so the site can print the time in the station's local time.
 
 Validated as the M7 study (docs/m7-localday-peaktimes-2026-10-01.md in the
 site repo, 11,910 station-days). Display rule (site side): a time is shown
@@ -107,7 +108,7 @@ def peaks_from_csv(text: str, day: dt.date, tzmap: dict[str, str], min_mph: floa
         if mph < min_mph:
             continue
         out.append({"stid": st, "date": day.isoformat(), "peak_time_utc": t.strftime("%Y-%m-%dT%H:%M:00Z"),
-                    "peak_mph": mph, "src": src, "wind_hours": len(hours)})
+                    "peak_mph": mph, "src": src, "wind_hours": len(hours), "tz": tzmap[st]})
     return out
 
 
