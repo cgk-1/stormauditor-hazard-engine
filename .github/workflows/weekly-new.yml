@@ -5,6 +5,8 @@ on:
   workflow_dispatch:
     inputs:
       ncei_years: {description: "e.g. 2024,2025,2026", required: false}
+      dry_run: {description: "1 = compute everything, write nothing", required: false}
+      day_convention: {description: "v3 (default, empty) or v4 (Phase 5: adds hz_storm_events_v4; dry-run first, owner OK before any write)", required: false}
 jobs:
   refresh:
     runs-on: ubuntu-24.04
@@ -20,6 +22,8 @@ jobs:
           INGEST_SECRET: ${{ secrets.INGEST_SECRET_NEW }}
           TASKS: stations,ncei,hurdat
           NCEI_YEARS: ${{ github.event.inputs.ncei_years }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DAY_CONVENTION: ${{ github.event.inputs.day_convention }}
           FEED_OUT_DIR: feed-out
         run: python hazard_obs_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
