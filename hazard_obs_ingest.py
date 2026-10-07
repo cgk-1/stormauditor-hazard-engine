@@ -336,8 +336,12 @@ def task_lsr(run, d0, d1):
         run.note(key, f"lsr: repaired {len(repaired)} row(s) with an unquoted comma in a free-text "
                       f"field: {[','.join(r[:2] + r[7:9]) for r in repaired[:3]]}")
     if bad:
-        run.error(key, "lsr rows", f"{len(bad)} wind/hail LSR row(s) could not be read; the other "
-                                   f"{len(rows)} rows are written", details=bad)
+        # Warning, not error (review 2026-10-07): IEM occasionally emits a few
+        # rows with a mangled STATE; they are quarantined in the run record and
+        # the rest are written, but a red run on every rerun would be noise.
+        run.warn(key, f"{len(bad)} wind/hail LSR row(s) could not be read (quarantined: "
+                      f"{[b if isinstance(b, str) else str(b)[:80] for b in bad[:3]]}); the other "
+                      f"{len(rows)} rows are written")
     run.write(key, "hz_lsr", [("hz_lsr_ingest",
                                {"p_secret": run.secret, "p_d0": d0.isoformat(), "p_d1": d1.isoformat(),
                                 "p_rows": ch, "p_append": i > 0}) for i, ch in _chunks(rows)])
