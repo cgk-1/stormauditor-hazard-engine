@@ -24,6 +24,8 @@ the readings reports use as evidence).
 import csv, datetime as dt, io, json, time, urllib.parse, urllib.request
 from zoneinfo import ZoneInfo
 
+import feedguard as fg
+
 IEM = "https://mesonet.agron.iastate.edu"
 UA = {"User-Agent": "StormAuditor-HazardEngine/1.0 (station peak times)"}
 KT2MPH = 1.15078
@@ -31,23 +33,24 @@ MIN_MPH = 25.0
 _tz_cache: dict[str, dict[str, str]] = {}
 
 
-def _get(url, timeout=300, retries=4):
-    last = None
-    for a in range(retries):
-        try:
-            return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout).read().decode(errors="replace")
-        except Exception as e:  # network / 5xx
-            last = e
-            time.sleep(5 * (a + 1))
-    raise RuntimeError(f"{url}: {last}")
+def _get(url, timeout=300, retries=5):
+    """IEM GET with timeout, retries, backoff + jitter and polite pacing."""
+    return fg.http_get(url, headers=UA, timeout=timeout, retries=retries,
+                       base_sleep=5).decode(errors="replace")
 
 
 def station_tz(state: str) -> dict[str, str]:
     """{stid: tzname} for one state's ASOS network (IEM metadata)."""
     if state not in _tz_cache:
         gj = json.loads(_get(f"{IEM}/geojson/network/{state}_ASOS.geojson", timeout=120))
+        if not isinstance(gj, dict) or not isinstance(gj.get("features"), list):
+            raise fg.ValidationError(f"{state}_ASOS metadata is not a GeoJSON FeatureCollection")
         _tz_cache[state] = {f["id"]: f["properties"].get("tzname") for f in gj.get("features", [])
                             if f["properties"].get("tzname")}
+        no_tz = [f["id"] for f in gj["features"] if not f["properties"].get("tzname")]
+        if no_tz:
+            print(f"  [note] {state}_ASOS: {len(no_tz)} station(s) without a time zone are not "
+                  f"used for peak times: {no_tz[:10]}")
     return _tz_cache[state]
 
 
@@ -68,15 +71,28 @@ def _utc(s: str) -> dt.datetime:
 
 
 def _num(s):
-    try:
-        return float(s) if s not in ("", None, "M") else None
-    except ValueError:
+    """'' / None / 'M' = not reported. Anything else must be a number: an
+    unparseable value is an unexpected format (2026-10-07: it used to be
+    treated as 'not reported' silently)."""
+    if s in ("", None, "M"):
         return None
+    try:
+        return float(s)
+    except ValueError:
+        raise fg.ValidationError(f"unexpected non-numeric METAR value {s!r}") from None
+
+
+METAR_COLUMNS = {"station", "valid", "sknt", "gust", "peak_wind_gust", "peak_wind_time"}
 
 
 def peaks_from_csv(text: str, day: dt.date, tzmap: dict[str, str], min_mph: float = MIN_MPH) -> list[dict]:
     by_st: dict[str, list[dict]] = {}
-    for r in csv.DictReader(io.StringIO(text)):
+    rdr = csv.DictReader(io.StringIO(text))
+    cols = set(rdr.fieldnames or [])
+    if not METAR_COLUMNS <= cols:
+        raise fg.ValidationError(f"asos.py reply lacks columns {sorted(METAR_COLUMNS - cols)} "
+                                 f"(starts {text[:80]!r})")
+    for r in rdr:
         st = r.get("station")
         if st and st in tzmap:
             by_st.setdefault(st, []).append(r)
