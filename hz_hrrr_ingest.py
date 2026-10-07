@@ -50,17 +50,29 @@ DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged):
   * T7: hz_station_bg HRRR is written ONCE per date for every station (first
     chunk deletes the date, the rest append) from the own-zone composite. v3
     kept only the last tz group (Arizona).
-  * Hour alignment is kept as v3: the HRRR day is the 24 (23/25) hourly fields
-    ENDING at local 00:00 .. 23:00 (hrrr_hour(t) = hour ending t), i.e. local
-    23:00 D-1 .. 23:00 D. V4_HRRR_HOUR_ENDING=1 (dry runs only, owner decision
-    pending, report item T12) uses the hours ending 01:00 .. 24:00 instead.
-  * Test flags (DRY_RUN only): V4_ZONES=state, V4_DST=0 (see tzwin.py).
+  * T12 (Stage 4, owner-approved 2026-10-07): the v4 HRRR day is the 24
+    (23/25) hourly fields ENDING at local 01:00 .. 24:00 (hrrr_hour(t) = hour
+    ending t), i.e. the true local day 00:00 .. 24:00. v3 and Stage 3 used the
+    hours ending 00:00 .. 23:00 (local 23:00 D-1 .. 23:00 D, one hour early).
+    V4_HRRR_HOUR_ENDING=0 reproduces the Stage 3 alignment in DRY RUNS only.
+  * Test flags (DRY_RUN only): V4_ZONES=state, V4_DST=0 (see tzwin.py),
+    V4_HRRR_HOUR_ENDING=0.
+
+STAGE 4 (owner-approved 2026-10-07): the workflow passes DAY_CONVENTION=v4 on
+every schedule/dispatch unless a dispatch sets day_convention=v3 (the code's
+own default stays v3, so local runs without the variable are unchanged). T7
+(all-station HRRR backgrounds) and T12 are on in v4. Explicit-date runs end
+each fully successful day with the clear-step (clearstep.py, RPC
+hz_day_clear_states_v2): states of the run's scope that were not re-supplied
+lose their stale hz_hrrr_meta/hz_hrrr_points rows. CLEAR_STEP=0 turns it off;
+DRY_RUN only reports what it would clear. (hz_bg_coarse is a state-less upsert
+and hz_station_bg is replaced per date; neither needs the clear-step.)
 
 Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Optional: DATE / INGEST_DATE (local dates; default yesterday), STATES,
           FLOOR_MPH (default 30; the workflows pass 35), DRY_RUN, FEED_OUT_DIR,
           HZ_STATIONS_FILE (offline station list for dry runs),
-          DAY_CONVENTION (v3|v4), V4_ZONES / V4_DST / V4_HRRR_HOUR_ENDING (dry runs)
+          DAY_CONVENTION (v3|v4), V4_ZONES / V4_DST / V4_HRRR_HOUR_ENDING=0 (dry runs), CLEAR_STEP (1/0)
 Deps: requirements.txt (exact pins)
 """
 import os, json, gzip, time, struct, hashlib, tempfile, datetime as dt
@@ -70,6 +82,7 @@ import pygrib
 from shapely.geometry import shape, Point
 from shapely.prepared import prep
 
+import clearstep
 import feedguard as fg
 import tzwin
 
@@ -755,10 +768,22 @@ def main(run):
                      "numpy": np.__version__, "pygrib": pygrib.__version__})
     conv = tzwin.convention()
     flags = tzwin.test_flags(run.dry_run) if conv == "v4" else None
-    hour_ending = (os.environ.get("V4_HRRR_HOUR_ENDING") or "0").strip() == "1"
-    if hour_ending and (conv != "v4" or not run.dry_run):
-        raise fg.ValidationError("V4_HRRR_HOUR_ENDING=1 is a dry-run preview of plan item T12 "
-                                 "(owner decision pending); it needs DAY_CONVENTION=v4 and DRY_RUN=1")
+    # T12 (owner-approved 2026-10-07, "fix early hrrr"): in v4 the HRRR day is the
+    # hourly fields ENDING 01:00 .. 24:00 local, i.e. the true local day 00:00-24:00.
+    # V4_HRRR_HOUR_ENDING=0 keeps the Stage 3 alignment (hours ending 00:00 ..
+    # 23:00 = 23:00 D-1 .. 23:00 D) and is a DRY-RUN-ONLY parity flag. v3 never shifts.
+    he = (os.environ.get("V4_HRRR_HOUR_ENDING") or "").strip()
+    if he not in ("", "0", "1"):
+        raise fg.ValidationError(f"V4_HRRR_HOUR_ENDING={he!r} (use 1, or 0 in dry runs)")
+    if conv == "v4":
+        hour_ending = he != "0"
+        if not hour_ending and not run.dry_run:
+            raise fg.ValidationError("V4_HRRR_HOUR_ENDING=0 (the Stage 3 hour alignment, one hour early) "
+                                     "is a dry-run parity flag; v4 writes use the true local day (T12)")
+    else:
+        if he == "1":
+            raise fg.ValidationError("V4_HRRR_HOUR_ENDING=1 needs DAY_CONVENTION=v4 (v3 keeps its alignment)")
+        hour_ending = False
     run.meta["day_convention"] = conv
     if conv == "v4":
         run.meta.update({"tzwin_md5": tzwin.module_md5(), "zone_map_md5": tzwin.zone_map("hrrr").md5,
@@ -770,6 +795,12 @@ def main(run):
             process_local_date_v4(run, d, states, policy, flags, hour_ending)
         else:
             process_local_date(run, d, states, policy)
+        # Stage 4 clear-step (explicit-date runs only, fully successful days only):
+        # states of this run's scope that were NOT re-supplied lose their stale
+        # hz_hrrr_meta / hz_hrrr_points rows (clearstep.py).
+        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        clearstep.after_day(run, key, "HRRR", states, run.day(key)["written"],
+                            explicit=policy == "strict")
 
 
 if __name__ == "__main__":

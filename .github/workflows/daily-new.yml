@@ -8,7 +8,8 @@ on:
       tasks: {description: "obs tasks", default: "dailies,peaks,lsr"}
       run_hrrr: {description: "run the HRRR job (set false for obs-only)", default: "true"}
       dry_run: {description: "1 = compute everything, write nothing", required: false}
-      day_convention: {description: "v3 (default, empty) or v4 (Phase 5 own-zone local days; dry-run first, owner OK before any write)", required: false}
+      day_convention: {description: "Empty = v4 (own-zone local days, nightly default since Stage 4, owner-approved 2026-10-07; obs writes the v3 tables AND the v4 tables). v3 = rollback/override only.", required: false}
+      clear_step: {description: "HRRR, explicit dates only: 1 (default) = after a fully successful day, clear stale rows of states not re-supplied (hz_day_clear_states_v2). 0 = off.", required: false}
 # One run at a time; a second trigger queues behind the first (never cancels it).
 concurrency: {group: hazard-daily, cancel-in-progress: false}
 jobs:
@@ -29,7 +30,8 @@ jobs:
           INGEST_DATE: ${{ github.event.inputs.ingest_date }}
           FLOOR_MPH: "35"
           DRY_RUN: ${{ github.event.inputs.dry_run }}
-          DAY_CONVENTION: ${{ github.event.inputs.day_convention }}
+          DAY_CONVENTION: ${{ github.event.inputs.day_convention || 'v4' }}
+          CLEAR_STEP: ${{ github.event.inputs.clear_step }}
           FEED_OUT_DIR: feed-out
         run: python hz_hrrr_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
@@ -55,7 +57,7 @@ jobs:
           INGEST_DATE: ${{ github.event.inputs.ingest_date }}
           TASKS: ${{ github.event.inputs.tasks || 'dailies,peaks,lsr' }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
-          DAY_CONVENTION: ${{ github.event.inputs.day_convention }}
+          DAY_CONVENTION: ${{ github.event.inputs.day_convention || 'v4' }}
           FEED_OUT_DIR: feed-out
         run: python hazard_obs_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)

@@ -40,6 +40,11 @@ to the previous version for well-formed upstream replies:
     processed; the old code silently used only the first date).
   * DRY_RUN=1, completeness summary and the FEED_RESULT json line: feedguard.py.
 
+STAGE 4 (owner-approved 2026-10-07): the workflows pass DAY_CONVENTION=v4 on every
+schedule/dispatch unless a dispatch sets day_convention=v3 (the code's own default
+stays v3). Readers and the engine keep reading the v3 tables until a later
+approved switch; T4 (hz_station_daily_v4) stays an extra table only.
+
 DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged).
 Every v3 table keeps receiving exactly the v3 payload; v4 adds rows to NEW
 additive tables (migration 20261007150000_phase5_v4_obs.sql in the site repo):
@@ -52,7 +57,8 @@ additive tables (migration 20261007150000_phase5_v4_obs.sql in the site repo):
   * Dailies (T4) -> hz_station_daily_v4 via hz_station_daily_ingest_v4: the
     station's daily max gust from the SAME METAR pull as the peaks task, on the
     station's own DST-aware local day (station_peaks.daily_v4_from_csv). v4
-    therefore needs the peaks task whenever dailies are requested.
+    therefore needs the peaks task (TASKS=dailies alone writes only the v3
+    dailies and warns).
   * NCEI (T5) -> hz_storm_events_v4 via hz_storm_events_ingest_v4: NCEI BEGIN
     date/time are local STANDARD time of CZ_TIMEZONE; v4 stores the true UTC
     instant (begin - CZ_TIMEZONE offset) and the local date in the zone of the
@@ -665,8 +671,12 @@ def main(run):
     run.meta["day_convention"] = conv
     if v4:
         if "dailies" in tasks and "peaks" not in tasks:
-            raise fg.ValidationError("DAY_CONVENTION=v4: the v4 dailies come from the peaks task's METAR "
-                                     "pull - run TASKS with peaks too")
+            # Stage 4: v4 is the nightly default, so a manual dailies-only re-pull must
+            # keep working. The v3 dailies (hz_station_daily) are written as always; the
+            # v4 daily comes from the peaks task's METAR pull, so it is NOT written here.
+            run.warn(f"{dates[0]}", "TASKS has dailies without peaks: hz_station_daily (v3) is written; "
+                                    "hz_station_daily_v4 is not (it comes from the peaks task's METAR pull - "
+                                    "add peaks to refresh it)")
         if any(t in tasks for t in ("peaks", "lsr", "ncei")):
             run.meta.update({"tzwin_md5": tzwin.module_md5(), "tz_poly_fingerprint": _tz_lookup().fingerprint})
 
