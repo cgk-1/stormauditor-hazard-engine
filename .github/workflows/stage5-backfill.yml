@@ -10,6 +10,9 @@ name: stage5-backfill
 #   the same day fails 3 runs in a row. The schedule exists only on the default branch.
 # - Manual runs are DRY RUNS unless dry_run=0 (nothing written: no feed write, roll or cursor).
 on:
+  push:            # TEMPORARY (registers the new workflow so the branch can be dry-run; removed next commit)
+    branches: [stage5-backfill]
+    paths: [.github/workflows/stage5-backfill.yml]
   schedule:
     - cron: "7,37 0-4 * * *"
     - cron: "52 5 * * *"
