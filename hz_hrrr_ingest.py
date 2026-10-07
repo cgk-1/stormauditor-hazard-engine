@@ -791,6 +791,11 @@ def main(run):
     print(f"HRRR ingest v2 ({conv} local-clock days): {len(dates)} date(s), "
           f"{len(states)} state(s){f' {flags}' if flags else ''}{' [T12 hour-ending]' if hour_ending else ''}")
     for d in dates:
+        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        # Redo shadow (explicit-date runs only): snapshot the day's old rows first;
+        # no snapshot -> the day is not written (clearstep.py).
+        if not clearstep.before_day(run, key, "HRRR", explicit=policy == "strict"):
+            continue
         if conv == "v4":
             process_local_date_v4(run, d, states, policy, flags, hour_ending)
         else:
@@ -798,9 +803,15 @@ def main(run):
         # Stage 4 clear-step (explicit-date runs only, fully successful days only):
         # states of this run's scope that were NOT re-supplied lose their stale
         # hz_hrrr_meta / hz_hrrr_points rows (clearstep.py).
-        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
         clearstep.after_day(run, key, "HRRR", states, run.day(key)["written"],
                             explicit=policy == "strict")
+        if policy == "strict":
+            exp = {"hz_hrrr_points": clearstep.rows(run, key, "hz_hrrr_ingest.p_points")}
+            if conv == "v4":      # v3 keeps only the last tz group's station rows (T7)
+                exp["hz_station_bg"] = clearstep.rows(run, key, "hz_station_bg_ingest.p_rows")
+            if set(states) == set(PERMITTED_STATES):
+                exp["hz_hrrr_meta"] = len([s for s in run.day(key)["written"] if s in PERMITTED_STATES])
+            clearstep.postcheck(run, key, "HRRR", exp)
 
 
 if __name__ == "__main__":

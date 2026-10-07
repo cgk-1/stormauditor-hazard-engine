@@ -77,6 +77,7 @@ from decimal import Decimal
 
 from zoneinfo import ZoneInfo
 
+import clearstep
 import feedguard as fg
 import tzwin
 
@@ -686,7 +687,16 @@ def main(run):
         except Exception as e:
             run.error("stations", "stations", f"{type(e).__name__}: {e}")
     if any(t in tasks for t in ("dailies", "peaks", "lsr")):
+        # Redo shadow (explicit-date runs only): snapshot every requested date's obs rows
+        # (v3 + v4 tables) before anything is written; a date range with a failed
+        # snapshot is not written at all (clearstep.py).
+        snap_ok = {d: clearstep.before_day(run, d.isoformat(), "OBS", explicit=explicit is not None)
+                   for d in dates}
         for d0, d1 in date_runs(dates):
+            if not all(snap_ok[d0 + dt.timedelta(days=i)] for i in range((d1 - d0).days + 1)):
+                run.error(f"{d0}", "redo-snapshot", f"obs {d0}..{d1}: a date of this range has no snapshot; "
+                                                    f"the range is NOT written")
+                continue
             if "dailies" in tasks:
                 try:
                     task_dailies(run, d0, d1)

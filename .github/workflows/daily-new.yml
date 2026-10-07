@@ -10,6 +10,8 @@ on:
       dry_run: {description: "1 = compute everything, write nothing", required: false}
       day_convention: {description: "Empty = v4 (own-zone local days, nightly default since Stage 4, owner-approved 2026-10-07; obs writes the v3 tables AND the v4 tables). v3 = rollback/override only.", required: false}
       clear_step: {description: "HRRR, explicit dates only: 1 (default) = after a fully successful day, clear stale rows of states not re-supplied (hz_day_clear_states_v2). 0 = off.", required: false}
+      redo_run_id: {description: "Explicit dates only: name of the redo-shadow run (default <feed>-<run id>), e.g. wind-repair-c1.", required: false}
+      redo_release: {description: "Explicit dates only: 1 = release the day's redo shadow when the post-write row counts match the payload. Default 0 = keep it for release after the blind verifier.", required: false}
 # One run at a time; a second trigger queues behind the first (never cancels it).
 concurrency: {group: hazard-daily, cancel-in-progress: false}
 jobs:
@@ -32,6 +34,8 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           DAY_CONVENTION: ${{ github.event.inputs.day_convention || 'v4' }}
           CLEAR_STEP: ${{ github.event.inputs.clear_step }}
+          REDO_RUN_ID: ${{ github.event.inputs.redo_run_id }}
+          REDO_RELEASE: ${{ github.event.inputs.redo_release }}
           FEED_OUT_DIR: feed-out
         run: python hz_hrrr_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
@@ -57,6 +61,7 @@ jobs:
           INGEST_DATE: ${{ github.event.inputs.ingest_date }}
           TASKS: ${{ github.event.inputs.tasks || 'dailies,peaks,lsr' }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+          REDO_RUN_ID: ${{ github.event.inputs.redo_run_id }}
           DAY_CONVENTION: ${{ github.event.inputs.day_convention || 'v4' }}
           FEED_OUT_DIR: feed-out
         run: python hazard_obs_ingest.py
