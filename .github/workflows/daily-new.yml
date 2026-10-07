@@ -7,10 +7,12 @@ on:
       ingest_date: {description: "local YYYYMMDD or a:b range", required: false}
       tasks: {description: "obs tasks", default: "dailies,peaks,lsr"}
       run_hrrr: {description: "run the HRRR job (set false for obs-only)", default: "true"}
+# One run at a time; a second trigger queues behind the first (never cancels it).
+concurrency: {group: hazard-daily, cancel-in-progress: false}
 jobs:
   hrrr:
     if: ${{ github.event.inputs.run_hrrr != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +28,7 @@ jobs:
           FLOOR_MPH: "35"
         run: python hz_hrrr_ingest.py
   obs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
