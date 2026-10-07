@@ -40,8 +40,28 @@ to the previous version for well-formed upstream replies:
     processed; the old code silently used only the first date).
   * DRY_RUN=1, completeness summary and the FEED_RESULT json line: feedguard.py.
 
+DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged).
+Every v3 table keeps receiving exactly the v3 payload; v4 adds rows to NEW
+additive tables (migration 20261007150000_phase5_v4_obs.sql in the site repo):
+  * LSR (T1/T8) -> hz_lsr_v4 via hz_lsr_ingest_v4: each report's local date in
+    the zone of ITS OWN POINT (tzpoint.py = offline mirror of hz_tz_at; fallback
+    hz_state_tz(state) only for points with no US zone, tz_src='state'), with
+    the zone stored per row so displays can print the time in it. The fetch
+    window is extended by one small extra request (D+1 09Z-12Z) so Hawaii and
+    the Aleutians get their whole local evening.
+  * Dailies (T4) -> hz_station_daily_v4 via hz_station_daily_ingest_v4: the
+    station's daily max gust from the SAME METAR pull as the peaks task, on the
+    station's own DST-aware local day (station_peaks.daily_v4_from_csv). v4
+    therefore needs the peaks task whenever dailies are requested.
+  * NCEI (T5) -> hz_storm_events_v4 via hz_storm_events_ingest_v4: NCEI BEGIN
+    date/time are local STANDARD time of CZ_TIMEZONE; v4 stores the true UTC
+    instant (begin - CZ_TIMEZONE offset) and the local date in the zone of the
+    event point. The v3 row set is kept (rows without coordinates are skipped,
+    as in v3).
+
 Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Task selection: TASKS=stations,dailies,peaks,lsr,ncei,hurdat (default: dailies,peaks,lsr)
+DAY_CONVENTION=v3|v4 (default v3)
   DAILIES/LSR/PEAKS:  DATE / INGEST_DATE  (default yesterday UTC)
   NCEI:         NCEI_YEARS   e.g. "2022,2023,2024"  (default current year)
 Deps: requirements.txt (exact pins)
@@ -49,7 +69,10 @@ Deps: requirements.txt (exact pins)
 import os, csv, gzip, io, json, re, time, datetime as dt
 from decimal import Decimal
 
+from zoneinfo import ZoneInfo
+
 import feedguard as fg
+import tzwin
 
 UA = {"User-Agent": "StormAuditor-HazardEngine/1.0"}
 UTC = dt.timezone.utc
@@ -194,20 +217,43 @@ def task_dailies(run, d0, d1):
 
 
 # --------------------------------------------------------------------- peaks
-def task_peaks(run, d0, d1):
+def task_peaks(run, d0, d1, v4=False):
     """Station peak-gust TIME per local day (station_peaks.py) for the same
     dates as the dailies -> hz_station_peak. Separate table: the dailies'
-    delete/re-insert never touches it. One METAR request per network per day."""
+    delete/re-insert never touches it. One METAR request per network per day.
+    v4: the same METAR text also gives hz_station_daily_v4 (plan T4)."""
     import station_peaks as SP
     n = 0
     day = d0
     while day <= d1:
         key = day.isoformat()
-        rows = []
+        rows, v4_rows, v4_fail, disagree = [], [], [], []
         run.expect(key, "peak_networks", len(CONUS))
         for st in CONUS:
             try:
-                got = SP.peaks_for_day(st, day)
+                if v4:
+                    # One METAR pull feeds both the v3 peaks (IEM station zones,
+                    # exactly as peaks_for_day) and the v4 dailies (point zones).
+                    tzm = SP.station_tz(st)
+                    if not SP.station_meta(st):
+                        got = []      # empty IEM network (DC): peaks_for_day fetches nothing either
+                    else:
+                        text = SP.fetch_metars(st, day)
+                        got = SP.peaks_from_csv(text, day, tzm) if tzm else []
+                        try:
+                            zones, dis, unplaced = SP.daily_v4_zones(st, day, _tz_lookup())
+                            disagree += dis
+                            if unplaced:
+                                run.note(key, f"daily v4 {st}: {len(unplaced)} station(s) without coordinates "
+                                              f"or zone: {unplaced[:5]}")
+                            v4_rows += SP.daily_v4_from_csv(text, day, zones)
+                        except Exception as e:
+                            v4_fail.append(st)
+                            run.error(key, f"daily v4 {st}", f"{type(e).__name__}: {e}")
+                    if st not in v4_fail:
+                        run.receive(key, "daily_v4_networks")
+                else:
+                    got = SP.peaks_for_day(st, day)
                 big = [r for r in got if not (0 <= r["peak_mph"] <= 250)]
                 if big:
                     run.warn(key, f"peaks {st}: {len(big)} peak(s) outside 0-250 mph are dropped by "
@@ -216,12 +262,31 @@ def task_peaks(run, d0, d1):
                 run.receive(key, "peak_networks")
             except Exception as e:
                 run.error(key, f"peaks {st}", f"{type(e).__name__}: {e}")
+                if v4 and st not in v4_fail:
+                    v4_fail.append(st)      # no METARs for this network -> no v4 daily for the day
             time.sleep(0.3)
         # hz_station_peak_ingest is an upsert: writing complete networks is safe.
         run.write(key, "hz_station_peak", [("hz_station_peak_ingest",
                                             {"p_secret": run.secret, "p_rows": ch})
                                            for _, ch in _chunks(rows, 2000)])
         run.set_received(key, "peak_rows", len(rows))
+        if v4:
+            run.expect(key, "daily_v4_networks", len(CONUS))
+            run.set_received(key, "daily_v4_rows", len(v4_rows))
+            if disagree:
+                run.note(key, f"daily v4: {len(disagree)} station(s) whose IEM zone has another UTC offset "
+                              f"than their point zone (point zone used): {disagree[:8]}")
+            if v4_fail:
+                pass          # error already recorded; the v4 daily of this day is NOT written
+            elif len(v4_rows) < DAILIES_MIN_ROWS_PER_DAY:
+                run.error(key, "daily v4", f"only {len(v4_rows)} station-day gusts (< "
+                                           f"{DAILIES_MIN_ROWS_PER_DAY:.0f}): nothing written")
+            else:
+                run.write(key, "hz_station_daily_v4",
+                          [("hz_station_daily_ingest_v4",
+                            {"p_secret": run.secret, "p_d0": key, "p_d1": key,
+                             "p_rows": ch, "p_append": i > 0}) for i, ch in _chunks(v4_rows)])
+                run.written(key, "hz_station_daily_v4")
         n += len(rows)
         print(f"peaks {day}: {len(rows)} station-days >= {SP.MIN_MPH:g} mph with peak time")
         day += dt.timedelta(days=1)
@@ -278,7 +343,7 @@ def lsr_record(hdr, p):
     return cands[0][1], True
 
 
-def task_lsr(run, d0, d1):
+def task_lsr(run, d0, d1, v4=False):
     # 2026-09-04: fetch through d1+1 09:00Z (covers Pacific + margin) so the
     # end day's local EVENING rows are in this run's payload; hz_lsr_ingest
     # now deletes exactly [d0, d1] and keeps only rows whose state-local date
@@ -298,6 +363,31 @@ def task_lsr(run, d0, d1):
     except Exception as e:
         run.error(key, "lsr", f"{type(e).__name__}: {e}")
         return
+    rows, bad, repaired, kinds, other = lsr_rows(hdr, rdr)
+    run.set_received(key, "lsr_wind_rows", kinds["wind"])
+    run.set_received(key, "lsr_hail_rows", kinds["hail"])
+    run.set_received(key, "lsr_other_types", other)
+    if repaired:
+        run.note(key, f"lsr: repaired {len(repaired)} row(s) with an unquoted comma in a free-text "
+                      f"field: {[','.join(r[:2] + r[7:9]) for r in repaired[:3]]}")
+    if bad:
+        # Warning, not error (review 2026-10-07): IEM occasionally emits a few
+        # rows with a mangled STATE; they are quarantined in the run record and
+        # the rest are written, but a red run on every rerun would be noise.
+        run.warn(key, f"{len(bad)} wind/hail LSR row(s) could not be read (quarantined: "
+                      f"{[b if isinstance(b, str) else str(b)[:80] for b in bad[:3]]}); the other "
+                      f"{len(rows)} rows are written")
+    run.write(key, "hz_lsr", [("hz_lsr_ingest",
+                               {"p_secret": run.secret, "p_d0": d0.isoformat(), "p_d1": d1.isoformat(),
+                                "p_rows": ch, "p_append": i > 0}) for i, ch in _chunks(rows)])
+    run.written(key, "hz_lsr")
+    print(f"lsr {d0}..{d1}: {len(rows)} wind/hail reports")
+    if v4:
+        task_lsr_v4(run, key, d0, d1, rows)
+
+
+def lsr_rows(hdr, rdr):
+    """Parse the IEM LSR CSV body -> (rows, bad, repaired, kinds, other)."""
     rows, bad, repaired, kinds, other = [], [], [], {"wind": 0, "hail": 0}, 0
     for p in rdr:
         rec, why = lsr_record(hdr, p)
@@ -329,28 +419,102 @@ def task_lsr(run, d0, d1):
             "city": rec["CITY"][:80], "state": rec["STATE"][:2],
             "source": rec["SOURCE"][:40],
             "measured": rec["QUALIFIER"].strip().upper() == "M"})
-    run.set_received(key, "lsr_wind_rows", kinds["wind"])
-    run.set_received(key, "lsr_hail_rows", kinds["hail"])
-    run.set_received(key, "lsr_other_types", other)
-    if repaired:
-        run.note(key, f"lsr: repaired {len(repaired)} row(s) with an unquoted comma in a free-text "
-                      f"field: {[','.join(r[:2] + r[7:9]) for r in repaired[:3]]}")
-    if bad:
-        # Warning, not error (review 2026-10-07): IEM occasionally emits a few
-        # rows with a mangled STATE; they are quarantined in the run record and
-        # the rest are written, but a red run on every rerun would be noise.
-        run.warn(key, f"{len(bad)} wind/hail LSR row(s) could not be read (quarantined: "
-                      f"{[b if isinstance(b, str) else str(b)[:80] for b in bad[:3]]}); the other "
-                      f"{len(rows)} rows are written")
-    run.write(key, "hz_lsr", [("hz_lsr_ingest",
-                               {"p_secret": run.secret, "p_d0": d0.isoformat(), "p_d1": d1.isoformat(),
-                                "p_rows": ch, "p_append": i > 0}) for i, ch in _chunks(rows)])
-    run.written(key, "hz_lsr")
-    print(f"lsr {d0}..{d1}: {len(rows)} wind/hail reports")
+    return rows, bad, repaired, kinds, other
+
+
+_LOOKUP = None
+
+
+def _tz_lookup():
+    global _LOOKUP
+    if _LOOKUP is None:
+        import tzpoint
+        _LOOKUP = tzpoint.lookup()
+    return _LOOKUP
+
+
+def lsr_local(row):
+    """(iana, tz_src, local date) of one LSR row in v4: the zone of its own
+    point; hz_state_tz(state) only when the point has no US zone."""
+    import tzpoint
+    z = _tz_lookup().at(row["lat"], row["lon"])
+    src = "point"
+    if not z:
+        z, src = tzpoint.state_tz_db(row["state"]), "state"
+    t = row["time_utc"]
+    u = dt.datetime(int(t[:4]), int(t[4:6]), int(t[6:8]), int(t[8:10]), int(t[10:12] or 0), tzinfo=UTC)
+    return z, src, u.astimezone(ZoneInfo(z)).date()
+
+
+def task_lsr_v4(run, key, d0, d1, rows):
+    """hz_lsr_v4: the v3 rows plus the D+1 09Z-12Z tail, each dated in its own
+    point's zone, keeping exactly the local dates d0..d1."""
+    url = (f"{IEM}/cgi-bin/request/gis/lsr.py?sts={d1 + dt.timedelta(days=1):%Y-%m-%d}T09:00Z"
+           f"&ets={d1 + dt.timedelta(days=1):%Y-%m-%d}T12:00Z&fmt=csv")
+    try:
+        text = _get(url, timeout=300)
+        rdr = csv.reader(io.StringIO(text))
+        hdr = next(rdr, None)
+        if not hdr or not set(LSR_COLUMNS) <= set(hdr):
+            raise fg.ValidationError(f"LSR tail reply lacks columns "
+                                     f"{sorted(set(LSR_COLUMNS) - set(hdr or []))} (starts {text[:80]!r})")
+        tail, bad, _rep, _k, _o = lsr_rows(hdr, rdr)
+        if bad:
+            run.warn(key, f"{len(bad)} wind/hail LSR tail row(s) could not be read (quarantined)")
+        seen = {json.dumps(r, sort_keys=True) for r in rows}
+        out, by_src = [], {"point": 0, "state": 0}
+        for r in rows + [r for r in tail if json.dumps(r, sort_keys=True) not in seen]:
+            z, src, ld = lsr_local(r)
+            if d0 <= ld <= d1:
+                out.append(dict(r, date=ld.isoformat(), tz=z, tz_src=src))
+                by_src[src] += 1
+        run.set_received(key, "lsr_v4_rows", len(out))
+        run.set_received(key, "lsr_v4_tail_rows", len(tail))
+        run.set_received(key, "lsr_v4_state_fallback", by_src["state"])
+        run.write(key, "hz_lsr_v4", [("hz_lsr_ingest_v4",
+                                      {"p_secret": run.secret, "p_d0": d0.isoformat(), "p_d1": d1.isoformat(),
+                                       "p_rows": ch, "p_append": i > 0}) for i, ch in _chunks(out)])
+        run.written(key, "hz_lsr_v4")
+        print(f"lsr v4 {d0}..{d1}: {len(out)} reports on their own local dates "
+              f"({by_src['state']} on the state zone: no US zone at the point)")
+    except Exception as e:
+        run.error(key, "lsr v4", f"{type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------- ncei
-def task_ncei(run, years):
+CZ_TZ_RE = re.compile(r"^([A-Z]{3,4})-?(\d{1,2})$")
+# Standard-time abbreviation -> DST-aware IANA zone, used ONLY for NCEI rows whose
+# point has no US zone (far offshore). Others (SST, GST, ...) keep the v3 date.
+CZ_FAMILY = {"EST": "America/New_York", "CST": "America/Chicago", "MST": "America/Denver",
+             "PST": "America/Los_Angeles", "AKST": "America/Anchorage", "HST": "Pacific/Honolulu",
+             "AST": "America/Puerto_Rico"}
+
+
+def ncei_v4_row(row, cz):
+    """The v4 fields of one NCEI row: true UTC from the CZ_TIMEZONE standard
+    offset, local date in the zone of the event point."""
+    m = CZ_TZ_RE.match((cz or "").strip().upper())
+    if not m:
+        raise fg.ValidationError(f"event {row['event_id']}: CZ_TIMEZONE {cz!r} not understood")
+    off = int(m.group(2))
+    if not 3 <= off <= 11:
+        raise fg.ValidationError(f"event {row['event_id']}: CZ_TIMEZONE {cz!r} offset outside UTC-3..-11")
+    b = row["begin_utc"]          # v3 name; really LOCAL STANDARD time YYYYMMDDHHMM
+    local = dt.datetime(int(b[:4]), int(b[4:6]), int(b[6:8]), int(b[8:10]), int(b[10:12]))
+    utc = (local + dt.timedelta(hours=off)).replace(tzinfo=UTC)
+    import tzpoint
+    z, src = _tz_lookup().at(row["lat"], row["lon"]), "point"
+    if not z:
+        z, src = CZ_FAMILY.get(m.group(1)), "cz"
+    if z:
+        d = utc.astimezone(ZoneInfo(z)).date()
+    else:
+        z, src, d = None, "none", local.date()
+    return {"cz_timezone": cz.strip(), "begin_utc_true": utc.strftime("%Y-%m-%dT%H:%M:00Z"),
+            "tz": z, "tz_src": src, "date_v4": d.isoformat()}
+
+
+def task_ncei(run, years, v4=False):
     listing = _get(NCEI_DIR, timeout=180)
     for yr in years:
         key = f"ncei {yr}"
@@ -366,9 +530,11 @@ def task_ncei(run, years):
             rdr = csv.DictReader(io.StringIO(raw.decode(errors="replace")))
             need = {"EVENT_ID", "EVENT_TYPE", "BEGIN_LAT", "BEGIN_LON", "BEGIN_YEARMONTH",
                     "BEGIN_DAY", "BEGIN_TIME", "MAGNITUDE", "MAGNITUDE_TYPE", "STATE", "CZ_NAME"}
+            if v4:
+                need = need | {"CZ_TIMEZONE"}
             if not need <= set(rdr.fieldnames or []):
                 raise fg.ValidationError(f"NCEI {yr} lacks columns {sorted(need - set(rdr.fieldnames or []))}")
-            rows, bad, no_coords = [], [], 0
+            rows, bad, no_coords, czs = [], [], 0, []
             for r in rdr:
                 et = r.get("EVENT_TYPE", "")
                 if et not in NCEI_TYPES:
@@ -395,6 +561,7 @@ def task_ncei(run, years):
                     "mag_type": r.get("MAGNITUDE_TYPE") or None,   # MG=measured EG=estimated
                     "state": r.get("STATE", "")[:24],
                     "cz_name": r.get("CZ_NAME", "")[:60]})
+                czs.append(r.get("CZ_TIMEZONE"))
             run.set_received(key, "events", len(rows))
             run.set_received(key, "events_without_point", no_coords)
             if bad:
@@ -405,6 +572,25 @@ def task_ncei(run, years):
                                                  "p_append": i > 0}) for i, ch in _chunks(rows)])
             run.written(key, "hz_storm_events")
             print(f"ncei {yr}: {len(rows)} finalized events")
+            if v4:
+                v4_rows, v4_bad = [], []
+                for row, cz in zip(rows, czs):
+                    try:
+                        v4_rows.append(dict(row, **ncei_v4_row(row, cz)))
+                    except fg.ValidationError as e:
+                        v4_bad.append({"event_id": row["event_id"], "error": str(e)})
+                if v4_bad:
+                    run.error(key, "ncei v4 rows", f"{len(v4_bad)} NCEI row(s) without a usable CZ_TIMEZONE; "
+                                                   f"the v4 year is NOT written", details=v4_bad[:200])
+                else:
+                    moved = sum(1 for r in v4_rows if r["date_v4"] != f"{r['begin_utc'][:4]}-{r['begin_utc'][4:6]}-{r['begin_utc'][6:8]}")
+                    run.set_received(key, "events_v4", len(v4_rows))
+                    run.set_received(key, "events_v4_date_changed", moved)
+                    run.write(key, "hz_storm_events_v4", [("hz_storm_events_ingest_v4",
+                                                           {"p_secret": run.secret, "p_year": int(yr), "p_rows": ch,
+                                                            "p_append": i > 0}) for i, ch in _chunks(v4_rows)])
+                    run.written(key, "hz_storm_events_v4")
+                    print(f"ncei v4 {yr}: {len(v4_rows)} events, {moved} on another local date than v3")
         except Exception as e:
             run.error(key, "ncei", f"{type(e).__name__}: {e}")
 
@@ -462,6 +648,15 @@ def main(run):
     explicit = fg.requested_dates()
     dates = explicit if explicit is not None else [dt.datetime.now(UTC).date() - dt.timedelta(days=1)]
     run.meta["tasks"] = tasks
+    conv = tzwin.convention()
+    v4 = conv == "v4"
+    run.meta["day_convention"] = conv
+    if v4:
+        if "dailies" in tasks and "peaks" not in tasks:
+            raise fg.ValidationError("DAY_CONVENTION=v4: the v4 dailies come from the peaks task's METAR "
+                                     "pull - run TASKS with peaks too")
+        if any(t in tasks for t in ("peaks", "lsr", "ncei")):
+            run.meta.update({"tzwin_md5": tzwin.module_md5(), "tz_poly_fingerprint": _tz_lookup().fingerprint})
 
     if "stations" in tasks:
         try:
@@ -477,18 +672,18 @@ def main(run):
                     run.error(f"{d0}", "dailies", f"{type(e).__name__}: {e}")
             if "peaks" in tasks:
                 try:   # peak times are an add-on: never let them block the lsr task
-                    task_peaks(run, d0, d1)
+                    task_peaks(run, d0, d1, v4)
                 except Exception as e:
                     run.error(f"{d0}", "peaks", f"{type(e).__name__}: {e}")
             if "lsr" in tasks:
                 try:
-                    task_lsr(run, d0, d1)
+                    task_lsr(run, d0, d1, v4)
                 except Exception as e:
                     run.error(f"{d0}", "lsr", f"{type(e).__name__}: {e}")
     if "ncei" in tasks:
         years = [y.strip() for y in (os.environ.get("NCEI_YEARS") or
                                      str(dt.date.today().year)).split(",") if y.strip()]
-        task_ncei(run, years)
+        task_ncei(run, years, v4)
     if "hurdat" in tasks:
         try:
             task_hurdat(run)
