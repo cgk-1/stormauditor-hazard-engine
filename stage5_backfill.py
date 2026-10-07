@@ -1,49 +1,47 @@
 #!/usr/bin/env python3
 """stage5_backfill.py - Archive Phase 5, Stage 5 (owner-approved 2026-10-07: "yes do that
-workflow"; "fast track ... get moving on the archive plan now").
+workflow", "go, B", "make it MUCH faster").
 
-TEMPORARY, SELF-DISABLING backfill driver, run by .github/workflows/stage5-backfill.yml.
-It backfills 2021-10-01 -> the day before each source's existing data in the v4 (own-zone
+TEMPORARY, SELF-DISABLING, PARALLEL backfill driver for .github/workflows/stage5-backfill.yml.
+Backfills 2021-10-01 -> the day before each source's existing data in the v4 (own-zone
 local-day) convention and rolls every backfilled grid day straight into the archive.
 
-How (per lane step, newest missing days first, walking backward):
-  1. gates: quiet UTC window, no feed workflow queued/running in the three feed repos, DB
-     size <= MAX_DB_GB (20), < 7 active DB backends, lane contiguous with the archive.
-  2. ingest a small batch (<= 3 days; OBS <= 7) with the FEED'S OWN ENTRYPOINT, exactly as
-     the nightly workflows run it: DATE=<a..b> (explicit dates -> strict hours, redo shadow,
-     clear-step), DAY_CONVENTION=v4, HRRR FLOOR_MPH=35, same pinned requirements, the feed
-     repos' main branches (= the nightly code).
-  3. read the feed's FEED_RESULT (result.json): a day counts only when its status is ok or
-     warning, nothing failed, and (live) the redo post-write row counts matched the payload.
-  4. live: hz_p5_roll_v1(lane, day) per day, newest first (service_role; sanity -> the same
-     hz_arch_roll(src, day, true) the nightly roll uses -> cursor, one transaction). The
-     nightly archive-roll never sees days older than the archive start, so this step is what
-     keeps the raw tables from re-bloating. Contiguity is enforced in SQL.
-  5. any failure stops the run (red). The same lane-day failing 3 runs in a row, a DB above
-     the size guard, a missing migration/key or an inconsistent cursor DISABLES the workflow
-     (feed-out/stage5/DISABLE -> the workflow's last step calls the GitHub API).
-  6. every lane past 2021-10-01 and NCEI 2021-2023 done -> "STAGE 5 COMPLETE" -> disables
-     itself the same way.
+Three modes (MODE=plan | shard | roll), one workflow run = plan -> N parallel shards -> roll:
 
-Lanes (cursor hz_backfill 'p5_<lane>' = oldest finished day):
-  HAIL  hail-feed mesh_ingest.py       2023-09-27 -> 2021-10-01   archive src HAIL
-  ANL   wind-feed wind_ingest.py       2024-07-22 -> 2021-10-01   archive src ANL + BGA
-  HRRR  hazard    hz_hrrr_ingest.py    2024-07-24 -> 2021-10-01   archive src HRRR + BGH
-  OBS   hazard    hazard_obs_ingest.py 2024-07-21 -> 2021-10-01   dailies, peaks, lsr (+ v4 tables)
-                                                                  (2024-07-21 without lsr: hz_lsr has it)
-  NCEI  hazard    hazard_obs_ingest.py years 2023, 2022, 2021     hz_storm_events + _v4
+  plan   reads hz_p5_status_v1 (cursors, ready markers, archive starts, DB size, active
+         backends), checks the gates and writes the shard matrix: for each lane the next
+         pending days (not rolled, not marked ready), newest first, dealt round-robin to the
+         lane's shards (shard i gets days i, i+S, i+2S, ...) so all shards advance together
+         and the contiguous roll keeps up. A lane never runs more than LOOKAHEAD days ahead
+         of its roll cursor (bounds the raw rows in flight).
+  shard  for each assigned day, newest first: gates (forbidden windows, feed runs, DB load,
+         DB size) -> the FEED'S OWN ENTRYPOINT for that day (DATE=day, DAY_CONVENTION=v4 ->
+         strict hours, redo shadow, clear-step; HRRR FLOOR_MPH=35; same pins, feed main
+         branches) -> FEED_RESULT check (ok/warning, nothing failed, redo post-write counts
+         match) -> ready marker hz_backfill 'p5_ready_<lane>_<day>'. Shard 0 of each lane is the
+         lane's roller: after each of its days it rolls every contiguous ready day.
+         A failed day is skipped (others continue), counted in 'p5_fail_<lane>_<day>'; the
+         3rd failed run of the same day disables the workflow.
+  roll   after all shards: rolls every contiguous ready day of every lane.
 
-RUN_MODE != live (or DRY_RUN=1): computes everything on the runner and writes NOTHING (no feed write, no roll, no
-cursor, no fail counter, never disables). With DATES=... the listed days run for every lane in
-LANES (window gate off when IGNORE_WINDOW=1); without DATES the next planned batch per lane runs.
+Roll = hz_p5_roll_v1(lane, day) (service_role; sanity -> the nightly's hz_arch_roll(src, day,
+true) -> cursor, one transaction) ONLY for cursor-1 and only when its ready marker exists:
+ingest may run ahead, the archive stays strictly contiguous (the nightly roll never meets a hole).
 
-Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET, SUPABASE_SERVICE_ROLE_KEY (live only),
-GH_TOKEN, GITHUB_REPOSITORY, GITHUB_RUN_ID, HAIL_DIR, WIND_DIR, HAZARD_DIR, OUT_DIR,
-RUN_MODE (live|dry, default dry), DRY_RUN, DATES, LANES, TIME_BUDGET_MIN (50), IGNORE_WINDOW, MAX_DB_GB (20), MAX_ACTIVE (6).
+Gates (never relaxed): no work 05:15-05:45, 09:00-11:00, 11:50-12:30, 15:50-17:00 UTC (a shard
+stops before a day that would overlap them, and frees its runner); no work while any feed
+workflow is queued/running in the three feed repos; DB > MAX_DB_GB (20) -> stop + disable;
+active backends > MAX_ACTIVE -> back off (wait, then stop); same day failing 3 runs -> disable;
+all lanes past 2021-10-01 + NCEI 2021-2023 -> "STAGE 5 COMPLETE" -> disable.
+
+RUN_MODE != live (or DRY_RUN=1): everything is computed, NOTHING is written (no feed write,
+marker, roll, cursor, counter; never disables). DATES=... (dry runs only) gives every shard of
+every lane in LANES explicit days instead of the plan.
 """
 import datetime as dt
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -54,29 +52,25 @@ import urllib.request
 UTC = dt.timezone.utc
 FLOOR = dt.date(2021, 10, 1)
 OWNER = "cgk-1"
-WORKFLOW_FILE = "stage5-backfill.yml"
 REDO_PREFIX = "stage5"
 
+# per_day = runner minutes per day measured in the 2026-10-07 dry run (ANL 4.2, OBS 2.6 with IEM
+# 429 backoff, HRRR 1.4, HAIL 0.25) plus write time and margin.
 LANES = {
     "HAIL": {"repo": "HAIL_DIR", "script": "mesh_ingest.py", "ceil": dt.date(2023, 9, 27),
-             "srcs": ["HAIL"], "batch": 3, "per_day": 3, "timeout": 40},
+             "srcs": ["HAIL"], "per_day": 1.0, "timeout": 30},
     "ANL": {"repo": "WIND_DIR", "script": "wind_ingest.py", "ceil": dt.date(2024, 7, 22),
-            "srcs": ["ANL", "BGA"], "batch": 3, "per_day": 7, "timeout": 60},
+            "srcs": ["ANL", "BGA"], "per_day": 5.5, "timeout": 40},
     "HRRR": {"repo": "HAZARD_DIR", "script": "hz_hrrr_ingest.py", "ceil": dt.date(2024, 7, 24),
-             "srcs": ["HRRR", "BGH"], "batch": 3, "per_day": 5, "timeout": 50, "env": {"FLOOR_MPH": "35"}},
+             "srcs": ["HRRR", "BGH"], "per_day": 2.5, "timeout": 30, "env": {"FLOOR_MPH": "35"}},
     "OBS": {"repo": "HAZARD_DIR", "script": "hazard_obs_ingest.py", "ceil": dt.date(2024, 7, 21),
-            "srcs": [], "batch": 7, "per_day": 3, "timeout": 50},
+            "srcs": [], "per_day": 3.5, "timeout": 30},
 }
 LANE_ORDER = ["HAIL", "ANL", "HRRR", "OBS"]
-LSR_EXISTS_FROM = dt.date(2024, 7, 21)          # hz_lsr already holds 2024-07-21 -> never re-pulled
+LSR_EXISTS_FROM = dt.date(2024, 7, 21)          # hz_lsr already holds 2024-07-21: never re-pulled
 NCEI_YEARS = [2023, 2022, 2021]
-NCEI_MIN = 2
-
-# Quiet UTC windows (start, end) in minutes after midnight. Outside them nothing starts:
-# feed dispatches 10:10/12:10/16:10, archive roll 05:23, nightly site build ~14:00-16:40.
-WINDOWS = [(0, 5 * 60 + 15), (5 * 60 + 45, 8 * 60 + 30), (18 * 60, 23 * 60 + 30)]
-
-# Workflows that must not overlap a backfill step (iron rule 5: one heavy worker at a time).
+# Forbidden UTC windows (minutes after midnight): archive roll, feed dispatch windows.
+FORBID = [(5 * 60 + 15, 5 * 60 + 45), (9 * 60, 11 * 60), (11 * 60 + 50, 12 * 60 + 30), (15 * 60 + 50, 17 * 60)]
 FEED_WORKFLOWS = {
     "stormauditor-hail-feed": {"hail-ingest-new.yml", "hail-gap-refill.yml", "hail-backfill-new.yml"},
     "stormauditor-wind-feed": {"wind-ingest-new.yml", "wind-backfill-new.yml", "bgwalk-new.yml"},
@@ -92,10 +86,33 @@ def now():
     return dt.datetime.now(UTC)
 
 
+def shard_counts():
+    """SHARDS env 'HAIL=1,ANL=9,HRRR=4,OBS=6' (defaults = 20 parallel jobs)."""
+    out = {"HAIL": 1, "ANL": 9, "HRRR": 4, "OBS": 6}
+    for tok in (os.environ.get("SHARDS") or "").split(","):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            if k.strip().upper() in out:
+                out[k.strip().upper()] = max(1, min(20, int(v)))
+    return out
+
+
+def minutes_to_forbidden(t=None):
+    """0 inside a forbidden window, else minutes until the next one starts."""
+    t = t or now()
+    m = t.hour * 60 + t.minute + t.second / 60
+    best = 24 * 60
+    for a, b in FORBID:
+        if a <= m < b:
+            return 0
+        d = (a - m) % (24 * 60)
+        best = min(best, d)
+    return best
+
+
 class Driver:
     def __init__(self):
-        # Live only when RUN_MODE=live (the workflow sets it for the schedule / dispatch dry_run=0)
-        # and DRY_RUN is not set; everything else is a dry run.
+        self.mode = (os.environ.get("MODE") or "shard").strip().lower()
         self.dry = (os.environ.get("RUN_MODE") or "").strip().lower() != "live" or flag("DRY_RUN")
         self.out = os.path.abspath(os.environ.get("OUT_DIR") or "feed-out")
         self.sdir = os.path.join(self.out, "stage5")
@@ -103,40 +120,43 @@ class Driver:
         self.base = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
         self.anon = os.environ.get("SUPABASE_ANON_KEY") or ""
         self.service = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+        self.mgmt = (os.environ.get("SUPABASE_ACCESS_TOKEN") or "").strip()   # sandbox roller fallback
         self.secret = os.environ.get("INGEST_SECRET") or ""
         self.gh = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
         self.run_id = os.environ.get("GITHUB_RUN_ID") or "local"
         self.started = now()
-        self.budget_s = 60 * float(os.environ.get("TIME_BUDGET_MIN") or 50)
+        self.budget_s = 60 * float(os.environ.get("TIME_BUDGET_MIN") or 300)
         self.max_db = float(os.environ.get("MAX_DB_GB") or 20)
-        self.max_active = int(os.environ.get("MAX_ACTIVE") or 6)
+        self.max_active = int(os.environ.get("MAX_ACTIVE") or 14)
+        self.lookahead = int(os.environ.get("LOOKAHEAD") or 150)
         self.lanes = [x.strip().upper() for x in (os.environ.get("LANES") or "HAIL,ANL,HRRR,OBS,NCEI").split(",")
                       if x.strip()]
-        bad = [x for x in self.lanes if x not in LANES and x != "NCEI"]
-        if bad:
-            raise SystemExit(f"::error::unknown LANES {bad}")
-        self.steps = []
-        self.notes = []
-        self.errors = []
+        self.lane = (os.environ.get("LANE") or "").strip().upper()
+        self.shard = int(os.environ.get("SHARD") or 0)
+        self.days_env = (os.environ.get("SHARD_DAYS") or "").strip()
+        self.steps, self.notes, self.errors, self.rolled = [], [], [], []
         self.disable_reason = None
         self.status = None
+        self._busy_at = 0.0
+        self._busy = []
+        tag = f"{self.mode}-{self.lane or 'all'}-{self.shard}"
+        self.result_path = os.path.join(self.sdir, f"result-{tag}.json")
 
     # ------------------------------------------------------------ output
     def note(self, msg):
-        print(f"[stage5] {msg}", flush=True)
+        print(f"[stage5 {self.mode} {self.lane}{self.shard if self.lane else ''}] {msg}", flush=True)
         self.notes.append(msg)
 
     def error(self, msg):
-        print(f"::error::stage5: {msg}", flush=True)
+        print(f"::error::stage5 {self.mode} {self.lane}: {msg}", flush=True)
         self.errors.append(msg)
 
     def disable(self, reason):
-        """Ask the workflow's last step to disable the workflow (never in a dry run)."""
         if self.dry:
             self.note(f"DRY RUN - would DISABLE the workflow: {reason}")
             return
         self.disable_reason = reason
-        with open(os.path.join(self.sdir, "DISABLE"), "w") as fh:
+        with open(os.path.join(self.sdir, "DISABLE"), "a") as fh:
             fh.write(reason + "\n")
         print(f"::warning::stage5: the workflow will DISABLE itself: {reason}", flush=True)
 
@@ -156,17 +176,17 @@ class Driver:
 
     def rpc_anon(self, name, payload, timeout=60):
         last = None
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 code, body = self._rpc(name, payload, self.anon, timeout)
-            except Exception as e:  # network
+            except Exception as e:
                 code, body = None, f"{type(e).__name__}: {e}"
             if code is not None and code < 300:
                 return body
             last = f"{name}: HTTP {code} {body}"
             if code in (400, 401, 403, 404):
                 break
-            time.sleep(3 * (attempt + 1))
+            time.sleep(3 * (attempt + 1) + random.random() * 3)
         raise RuntimeError(last)
 
     def gh_get(self, path):
@@ -177,37 +197,21 @@ class Driver:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())
 
-    # ------------------------------------------------------------ gates
-    def window_end(self, t=None):
-        """Datetime at which the current quiet window closes, or None outside every window."""
-        t = t or now()
-        m = t.hour * 60 + t.minute
-        for a, b in WINDOWS:
-            if a <= m < b:
-                return t.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(minutes=b)
-        return None
-
-    def deadline(self):
-        end = self.started + dt.timedelta(seconds=self.budget_s)
-        if self.dry and flag("IGNORE_WINDOW"):
-            return end
-        w = self.window_end()
-        return min(end, w) if w else None
-
-    def busy(self):
-        """Feed workflow runs queued or in progress in any feed repo -> list (empty = free)."""
+    def busy(self, max_age=600):
+        """Feed workflow runs queued/in progress in the feed repos (cached max_age s)."""
+        if time.time() - self._busy_at < max_age:
+            return self._busy
         found = []
         for repo, files in FEED_WORKFLOWS.items():
-            for st in ("in_progress", "queued", "waiting", "pending"):
-                data = self.gh_get(f"repos/{OWNER}/{repo}/actions/runs?status={st}&per_page=50")
-                for r in data.get("workflow_runs", []):
-                    if os.path.basename(r.get("path") or "") in files:
-                        found.append(f"{repo}/{os.path.basename(r['path'])} run {r['id']} {st}")
+            data = self.gh_get(f"repos/{OWNER}/{repo}/actions/runs?per_page=40")
+            for r in data.get("workflow_runs", []):
+                if r.get("status") in ("queued", "in_progress", "waiting", "pending", "requested") and \
+                        os.path.basename(r.get("path") or "") in files:
+                    found.append(f"{repo}/{os.path.basename(r['path'])} run {r['id']} {r['status']}")
+        self._busy, self._busy_at = found, time.time()
         return found
 
     def check_pins(self):
-        """The three feeds run in one interpreter: every pin must agree with wind-feed's
-        (the superset; same versions the nightlies use)."""
         def pins(d):
             out = {}
             with open(os.path.join(os.environ[d], "requirements.txt")) as fh:
@@ -222,99 +226,104 @@ class Driver:
                 if wind.get(k) != v:
                     raise RuntimeError(f"requirements differ: {d} pins {k}=={v}, wind-feed {wind.get(k)}")
 
-    def feed_shas(self):
-        out = {}
-        for d in ("HAIL_DIR", "WIND_DIR", "HAZARD_DIR"):
-            try:
-                out[d] = subprocess.run(["git", "-C", os.environ[d], "rev-parse", "HEAD"], capture_output=True,
-                                        text=True, check=True).stdout.strip()
-            except Exception as e:
-                out[d] = f"unknown ({e})"
-        return out
+    def service_check(self):
+        """Proves the service-role key is present and valid without printing it: a table read
+        only service_role may do (hz_backfill_log: revoked from anon) + the status RPC."""
+        if not self.service:
+            return "missing"
+        hdr = {"apikey": self.service, "Prefer": "count=exact", "Range": "0-0"}
+        if not self.service.startswith("sb_"):
+            hdr["Authorization"] = f"Bearer {self.service}"
+        req = urllib.request.Request(f"{self.base}/rest/v1/hz_backfill_log?select=id", headers=hdr)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                cr = r.headers.get("Content-Range", "")
+            code, body = self._rpc("hz_p5_status_v1", {"p_secret": self.secret}, self.service, 60)
+            ok = code == 200 and isinstance(body, dict)
+            return f"ok (hz_backfill_log readable, rows {cr.split('/')[-1]}; status rpc {code})" if ok else \
+                f"status rpc HTTP {code}"
+        except urllib.error.HTTPError as e:
+            return f"HTTP {e.code} (key invalid or not service_role)"
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
 
     # ------------------------------------------------------------ DB state
     def refresh_status(self):
-        try:
-            self.status = self.rpc_anon("hz_p5_status_v1", {"p_secret": self.secret})
-        except Exception as e:
-            self.status = None
-            if self.dry:
-                self.note(f"hz_p5_status_v1 unavailable ({str(e)[:160]}) - migration not applied yet; "
-                          f"dry run continues without DB gates")
-            else:
-                raise
+        self.status = self.rpc_anon("hz_p5_status_v1", {"p_secret": self.secret})
         return self.status
 
-    def cursor(self, key):
-        if self.status is not None:
-            return (self.status.get("cursors") or {}).get(key)
-        try:   # dry run before the migration: plain cursor read (anon, secret-gated, existing RPC)
-            return self.rpc_anon("hz_backfill_get", {"p_key": key, "p_secret": self.secret})
-        except Exception:
-            return None
+    def keys(self):
+        return (self.status or {}).get("cursors") or {}
 
-    def next_day(self, lane):
-        c = self.cursor(f"p5_{lane.lower()}")
-        return LANES[lane]["ceil"] if not c else dt.date.fromisoformat(c) - dt.timedelta(days=1)
+    def cursor(self, lane):
+        c = self.keys().get(f"p5_{lane.lower()}")
+        return dt.date.fromisoformat(c) if c else None
 
-    def next_ncei(self):
-        c = self.cursor("p5_ncei")
-        y = NCEI_YEARS[0] if not c else int(c[:4]) - 1
-        return y if y >= NCEI_YEARS[-1] else None
+    def next_roll_day(self, lane):
+        c = self.cursor(lane)
+        return LANES[lane]["ceil"] if not c else c - dt.timedelta(days=1)
 
-    def lane_block(self, lane, d):
-        """None when lane day d is contiguous with the archive of every source of the lane."""
-        if self.status is None or not LANES[lane]["srcs"]:
-            return None
-        amin = self.status.get("arch_min") or {}
-        for s in LANES[lane]["srcs"]:
-            m = amin.get(s)
-            if m is None or dt.date.fromisoformat(m) != d + dt.timedelta(days=1):
-                return f"{s} archive starts {m}, next {lane} day {d}"
-        return None
+    def ready(self, lane, d):
+        return self.keys().get(f"p5_ready_{lane.lower()}_{d}") == "ok"
 
-    def fail_count(self, tag):
-        raw = self.cursor("p5_fail")
-        try:
-            f = json.loads(raw) if raw else {}
-        except ValueError:
-            f = {}
-        return f.get("n", 0) if f.get("tag") == tag else 0
-
-    def set_fail(self, tag, n):
+    def set_key(self, key, value):
         if self.dry:
             return
-        try:
-            self.rpc_anon("hz_backfill_set", {"p_secret": self.secret, "p_key": "p5_fail",
-                                              "p_value": json.dumps({"tag": tag, "n": n, "run": self.run_id}) if n else ""})
-        except Exception as e:
-            self.error(f"could not store the fail counter: {e}")
+        self.rpc_anon("hz_backfill_set", {"p_secret": self.secret, "p_key": key, "p_value": value})
+        if self.status is not None:
+            self.status.setdefault("cursors", {})[key] = value
 
-    # ------------------------------------------------------------ one feed run
+    def fails(self, lane, d):
+        try:
+            return int(self.keys().get(f"p5_fail_{lane.lower()}_{d}") or 0)
+        except ValueError:
+            return 0
+
+    def gate_db(self):
+        """None = go; 'stop' = stop this job; raises on the size guard."""
+        if self.dry and self.status is None:
+            return None
+        waited = 0
+        while True:
+            st = self.refresh_status()
+            if st["db_bytes"] > self.max_db * 2**30:
+                self.disable(f"DB {st['db_bytes'] / 2**30:.2f} GB > {self.max_db} GB guard")
+                raise RuntimeError("DB size guard")
+            if st["active"] <= self.max_active:
+                return None
+            if waited >= 600:
+                self.note(f"DB busy ({st['active']} active backends) for 10 min - stopping this job")
+                return "stop"
+            w = 30 + random.random() * 60
+            self.note(f"DB busy ({st['active']} active > {self.max_active}) - backing off {w:.0f}s")
+            time.sleep(w)
+            waited += w
+
+    # ------------------------------------------------------------ feed run
     def run_feed(self, lane, dates, extra_env=None):
         cfg = LANES.get(lane) or LANES["OBS"]
         cwd = os.environ[cfg["repo"]]
-        tag = f"{lane.lower()}-{dates.replace('..', '_').replace(',', '_')}"
+        tag = f"{lane.lower()}-{(dates or 'none').replace('..', '_').replace(',', '_')}"
         fout = os.path.join(self.out, "feeds", tag)
         os.makedirs(fout, exist_ok=True)
         env = dict(os.environ)
         for k in ("DATE", "INGEST_DATE", "STATES", "TASKS", "NCEI_YEARS", "HOURS_POLICY", "BG_ONLY",
                   "V4_ZONES", "V4_DST", "V4_HRRR_HOUR_ENDING", "COLD_GUARD", "CLEAR_STEP", "REDO_SNAPSHOT",
-                  "REDO_RELEASE", "HEAL_SHORT_WINDOWS_FROM"):
+                  "REDO_RELEASE", "HEAL_SHORT_WINDOWS_FROM", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ACCESS_TOKEN",
+                  "GH_TOKEN", "GITHUB_TOKEN"):
             env.pop(k, None)
-        env.update({"DATE": dates, "DAY_CONVENTION": "v4", "DRY_RUN": "1" if self.dry else "",
-                    "FEED_OUT_DIR": fout, "REDO_RUN_ID": f"{REDO_PREFIX}-{lane.lower()}",
-                    "SUPABASE_URL": self.base, "SUPABASE_ANON_KEY": self.anon, "INGEST_SECRET": self.secret})
-        env.pop("SUPABASE_SERVICE_ROLE_KEY", None)        # the feeds only ever use the anon key
+        env.update({"DAY_CONVENTION": "v4", "DRY_RUN": "1" if self.dry else "", "FEED_OUT_DIR": fout,
+                    "REDO_RUN_ID": f"{REDO_PREFIX}-{lane.lower()}", "SUPABASE_URL": self.base,
+                    "SUPABASE_ANON_KEY": self.anon, "INGEST_SECRET": self.secret})
+        if dates:
+            env["DATE"] = dates
         env.update(cfg.get("env") or {})
         env.update(extra_env or {})
-        if not dates:
-            env.pop("DATE")
         t0 = time.time()
         print(f"::group::{lane} {dates or ''} {extra_env or ''}", flush=True)
         try:
-            p = subprocess.run([sys.executable, cfg["script"]], cwd=cwd, env=env, timeout=60 * cfg["timeout"])
-            code = p.returncode
+            code = subprocess.run([sys.executable, cfg["script"]], cwd=cwd, env=env,
+                                  timeout=60 * cfg["timeout"]).returncode
         except subprocess.TimeoutExpired:
             code = "timeout"
         print("::endgroup::", flush=True)
@@ -326,259 +335,304 @@ class Driver:
             self.error(f"{lane} {dates}: no FEED_RESULT ({e}); exit {code}")
         return code, res, round(time.time() - t0)
 
-    @staticmethod
-    def day_ok(res, key, dry):
+    def day_ok(self, lane, res, key):
+        if res is None:
+            return False, "no FEED_RESULT"
+        if lane == "OBS":
+            if res.get("status") == "error" or res.get("errors"):
+                return False, f"obs errors: {[e.get('msg', '')[:160] for e in res.get('errors', [])][:5]}"
+            if not self.dry:
+                d = next((x for x in res.get("days", []) if x.get("day") == key), {})
+                if (d.get("redo") or {}).get("status") not in ("taken", "exists"):
+                    return False, f"redo snapshot missing: {d.get('redo')}"
+            return True, "ok"
         d = next((x for x in res.get("days", []) if x.get("day") == key), None)
         if d is None:
             return False, "day missing from FEED_RESULT"
         if d.get("status") not in ("ok", "warning") or d.get("failed"):
-            return False, f"status {d.get('status')} failed {d.get('failed')}"
-        redo = d.get("redo") or {}
-        if not dry:
-            pc = redo.get("postcheck")
+            return False, f"status {d.get('status')} failed {d.get('failed')} errors " \
+                          f"{[e.get('msg', '')[:160] for e in res.get('errors', [])][:3]}"
+        if not self.dry:
+            pc = (d.get("redo") or {}).get("postcheck")
             if not (isinstance(pc, dict) and pc.get("ok")):
                 return False, f"redo post-write check not ok: {pc}"
         return True, "ok"
 
-    def summarize_feed(self, res):
+    @staticmethod
+    def summarize_feed(res):
         if not res:
             return None
-        days = [{k: d.get(k) for k in ("day", "status", "failed", "rows", "payload_md5", "expected", "received")}
+        days = [{k: d.get(k) for k in ("day", "status", "failed", "rows", "payload_md5", "received")}
                 | {"warnings": [w["msg"][:200] for w in res.get("warnings", []) if w.get("day") == d.get("day")],
                    "clear_step": (d.get("clear_step") or {}).get("would_clear", (d.get("clear_step") or {}).get("result")),
-                   "redo": {k: (d.get("redo") or {}).get(k) for k in ("status", "dry_run", "postcheck")}}
+                   "redo": {k: (d.get("redo") or {}).get(k) for k in ("status", "postcheck")},
+                   "retries": len(d.get("retries") or [])}
                 for d in res.get("days", [])]
         meta = res.get("meta") or {}
-        return {"feed": res.get("feed"), "status": res.get("status"), "dry_run": res.get("dry_run"),
-                "errors": res.get("errors"), "write_retries": res.get("write_retries"),
-                "meta": {k: meta.get(k) for k in ("day_convention", "zone_map_md5", "tzwin_md5", "hours_policy",
-                                                  "hour_ending", "cold_guard", "floor_mph", "tasks", "feedguard_md5")},
+        return {"feed": res.get("feed"), "status": res.get("status"), "errors": res.get("errors"),
+                "write_retries": res.get("write_retries"),
+                "meta": {k: meta.get(k) for k in ("day_convention", "zone_map_md5", "hours_policy",
+                                                  "hour_ending", "cold_guard", "floor_mph", "tasks")},
                 "days": days}
 
-    def roll(self, lane, day):
+    # ------------------------------------------------------------ roll
+    def roll_call(self, lane, day):
         if self.dry:
-            self.note(f"DRY RUN - would roll {lane} {day} (hz_p5_roll_v1)")
             return {"ok": True, "status": "dry_run"}
-        code, body = self._rpc("hz_p5_roll_v1", {"p_secret": self.secret, "p_lane": lane, "p_day": str(day),
-                                                 "p_run_id": f"{REDO_PREFIX}-{self.run_id}",
-                                                 "p_max_db_gb": self.max_db}, self.service, timeout=180)
-        if code is None or code >= 300 or not isinstance(body, dict):
-            return {"ok": False, "status": "http", "error": f"HTTP {code}: {body}"}
-        return body
+        payload_day = str(day)
+        if self.service:
+            code, body = self._rpc("hz_p5_roll_v1", {"p_secret": self.secret, "p_lane": lane, "p_day": payload_day,
+                                                     "p_run_id": f"{REDO_PREFIX}-{self.run_id}",
+                                                     "p_max_db_gb": self.max_db}, self.service, timeout=180)
+            if code is None or code >= 300 or not isinstance(body, dict):
+                return {"ok": False, "status": "http", "error": f"HTTP {code}: {body}"}
+            return body
+        if self.mgmt:      # sandbox fallback: management API (runs as postgres; secret read in-DB)
+            sql = (f"select hz_p5_roll_v1((select value from app_config where key='ingest_secret'), "
+                   f"'{lane}', '{payload_day}'::date, '{REDO_PREFIX}-sandbox', {self.max_db}) r")
+            req = urllib.request.Request("https://api.supabase.com/v1/projects/aozjsfjemobuzqrhxcxy/database/query",
+                                         data=json.dumps({"query": sql}).encode(),
+                                         headers={"Authorization": f"Bearer {self.mgmt}",
+                                                  "Content-Type": "application/json", "User-Agent": "curl/8"})
+            try:
+                with urllib.request.urlopen(req, timeout=180) as r:
+                    return json.loads(r.read().decode())[0]["r"]
+            except Exception as e:
+                return {"ok": False, "status": "http", "error": f"{type(e).__name__}: {e}"}
+        return {"ok": False, "status": "nokey", "error": "no SUPABASE_SERVICE_ROLE_KEY"}
 
-    # ------------------------------------------------------------ lane steps
-    def grid_or_obs_step(self, lane, days):
-        """days newest first. Returns True when every day succeeded (and, live, was rolled)."""
-        cfg = LANES[lane]
-        rng = f"{days[-1]}..{days[0]}" if len(days) > 1 else str(days[0])
-        extra = None
-        if lane == "OBS":
-            extra = {"TASKS": "dailies,peaks" if days[0] >= LSR_EXISTS_FROM else "dailies,peaks,lsr"}
-        code, res, secs = self.run_feed(lane, rng, extra)
-        step = {"lane": lane, "dates": rng, "exit": code, "seconds": secs, "feed": self.summarize_feed(res),
-                "rolled": [], "dry_run": self.dry}
-        self.steps.append(step)
-        if res is None:
-            return False, days[0], "no FEED_RESULT"
-        if lane == "OBS":
-            if res.get("status") == "error" or res.get("errors"):
-                return False, days[0], f"obs errors: {[e.get('msg', '')[:160] for e in res.get('errors', [])][:5]}"
-            if not self.dry:
-                for d in days:          # snapshot / post-write checks per date
-                    dd = next((x for x in res.get("days", []) if x.get("day") == str(d)), {})
-                    if (dd.get("redo") or {}).get("status") not in ("taken", "exists"):
-                        return False, d, f"redo snapshot missing for {d}: {dd.get('redo')}"
-        for d in days:                  # newest first: contiguous rolls
-            if lane != "OBS":
-                ok, why = self.day_ok(res, str(d), self.dry)
-                if not ok:
-                    return False, d, why
-            r = self.roll(lane, d)
-            step["rolled"].append({"day": str(d), "result": r})
-            if not r.get("ok"):
-                return False, d, f"roll {r.get('status')}: {r.get('error')}"
-            if r.get("status") == "rolled_warn":
-                print(f"::warning::stage5 {lane} {d}: row count outside 0.2x-5x of the recent median "
-                      f"{r.get('warnings')}", flush=True)
-        return True, None, None
+    def roll_ready(self, lanes):
+        """Roll every contiguous ready day of the lanes (newest first). Returns days rolled."""
+        n = 0
+        for lane in lanes:
+            if lane not in LANES:
+                continue
+            self.refresh_status()
+            while True:
+                d = self.next_roll_day(lane)
+                if d < FLOOR or not self.ready(lane, d):
+                    break
+                if minutes_to_forbidden() < 2:
+                    return n
+                r = self.roll_call(lane, d)
+                self.rolled.append({"lane": lane, "day": str(d), "result": r})
+                if not r.get("ok"):
+                    err = str(r.get("error"))
+                    if r.get("status") == "refused" and "is not the next one" in err:
+                        self.refresh_status()          # another roller got there first
+                        continue
+                    k = self.fails(lane, d) + 1
+                    self.error(f"roll {lane} {d} {r.get('status')}: {err} (attempt {k} of 3)")
+                    self.set_key(f"p5_fail_{lane.lower()}_{d}", str(k))
+                    self.set_key(f"p5_ready_{lane.lower()}_{d}", "")     # re-ingest it
+                    if k >= 3:
+                        self.disable(f"roll {lane} {d} failed 3 times: {err[:200]}")
+                    break
+                n += 1
+                if r.get("status") == "rolled_warn":
+                    print(f"::warning::stage5 {lane} {d}: row count outside 0.2x-5x of the recent median "
+                          f"{r.get('warnings')}", flush=True)
+                self.set_key(f"p5_{lane.lower()}", str(d))
+        return n
 
-    def ncei_step(self, year):
-        code, res, secs = self.run_feed("NCEI", "", {"TASKS": "ncei", "NCEI_YEARS": str(year)})
-        step = {"lane": "NCEI", "dates": str(year), "exit": code, "seconds": secs,
-                "feed": self.summarize_feed(res), "rolled": [], "dry_run": self.dry}
-        self.steps.append(step)
-        if res is None or res.get("status") == "error" or res.get("errors"):
-            return False, year, f"ncei errors: {(res or {}).get('errors')}"
-        d = next((x for x in res.get("days", []) if x.get("day") == f"ncei {year}"), {})
-        if set(d.get("written") or []) != {"hz_storm_events", "hz_storm_events_v4"}:
-            return False, year, f"ncei {year}: written {d.get('written')}"
-        r = self.roll("NCEI", dt.date(year, 1, 1))
-        step["rolled"].append({"day": f"{year}-01-01", "result": r})
-        if not r.get("ok"):
-            return False, year, f"roll {r.get('status')}: {r.get('error')}"
-        return True, None, None
+    # ------------------------------------------------------------ plan
+    def pending_days(self, lane, limit):
+        out = []
+        start = self.next_roll_day(lane)
+        d = start
+        while d >= FLOOR and len(out) < limit and (start - d).days < self.lookahead:
+            if not self.ready(lane, d):
+                out.append(d)
+            d -= dt.timedelta(days=1)
+        return out
 
-    def plan_next(self):
-        """(kind, lane, value) for the next step, or ('done', None, None) / ('wait', reason, None)."""
-        if "NCEI" in self.lanes:
-            y = self.next_ncei()
-            if y is not None:
-                return "ncei", "NCEI", y
-        best, waits = None, []
+    def plan(self):
+        shards = shard_counts()
+        include = []
+        if self.dry and os.environ.get("DATES"):
+            days = sorted({x.strip() for x in os.environ["DATES"].split(",") if x.strip()}, reverse=True)
+            for lane in self.lanes:
+                if lane == "NCEI":
+                    continue
+                for s in range(shards[lane]):
+                    mine = days[s::shards[lane]]
+                    if mine:
+                        include.append({"lane": lane, "shard": s, "days": ",".join(mine)})
+            if "NCEI" in self.lanes and not any(i["lane"] == "OBS" for i in include):
+                include.append({"lane": "OBS", "shard": 0, "days": ""})
+            return include, "dry-run sample dates"
+        mtf = minutes_to_forbidden()
+        budget = min(self.budget_s / 60, mtf - 5)
+        if budget < 10:
+            return [], f"{mtf:.0f} min to a forbidden window - no work this run"
+        busy = self.busy(0)
+        if busy:
+            return [], f"feed workflows active: {busy}"
+        if not self.dry and not self.service:
+            self.disable("SUPABASE_SERVICE_ROLE_KEY secret missing")
+            return [], "no service key"
         for lane in LANE_ORDER:
             if lane not in self.lanes:
                 continue
-            d = self.next_day(lane)
-            if d < FLOOR:
-                continue
-            blk = self.lane_block(lane, d)
-            if blk:
-                if lane == "ANL" and d == dt.date(2024, 7, 22) and \
-                        (self.status.get("arch_min") or {}).get("ANL") == "2024-07-24":
-                    waits.append("ANL waits for the owner decision on ANL 2024-07-23 (go-live step)")
+            per_shard = max(1, int(budget // LANES[lane]["per_day"]))
+            days = self.pending_days(lane, per_shard * shards[lane])
+            for s in range(shards[lane]):
+                mine = [str(d) for d in days[s::shards[lane]]]
+                if mine:
+                    include.append({"lane": lane, "shard": s, "days": ",".join(mine)})
+        ncei_c = self.keys().get("p5_ncei")
+        if "NCEI" in self.lanes and (not ncei_c or int(ncei_c[:4]) > NCEI_YEARS[-1]):
+            if not any(i["lane"] == "OBS" and i["shard"] == 0 for i in include):
+                include.append({"lane": "OBS", "shard": 0, "days": ""})
+        done = all(self.next_roll_day(l) < FLOOR for l in LANE_ORDER) and ncei_c and int(ncei_c[:4]) <= NCEI_YEARS[-1]
+        if done and set(self.lanes) >= set(LANE_ORDER) | {"NCEI"}:
+            self.note("STAGE 5 COMPLETE: every lane reached 2021-10-01 and NCEI 2021-2023 is loaded")
+            self.disable("Stage 5 backfill complete")
+        return include, f"budget {budget:.0f} min"
+
+    # ------------------------------------------------------------ shard
+    def ncei(self):
+        c = self.keys().get("p5_ncei")
+        years = [y for y in NCEI_YEARS if not c or y < int(c[:4])] if not (self.dry and os.environ.get("DATES")) \
+            else sorted({int(x.strip()[:4]) for x in os.environ["DATES"].split(",") if x.strip()}, reverse=True)
+        for y in years:
+            code, res, secs = self.run_feed("NCEI", "", {"TASKS": "ncei", "NCEI_YEARS": str(y)})
+            st = {"lane": "NCEI", "day": str(y), "exit": code, "seconds": secs, "feed": self.summarize_feed(res)}
+            self.steps.append(st)
+            d = next((x for x in (res or {}).get("days", []) if x.get("day") == f"ncei {y}"), {})
+            if res is None or res.get("errors") or set(d.get("written") or []) != {"hz_storm_events", "hz_storm_events_v4"}:
+                self.error(f"NCEI {y} failed: {(res or {}).get('errors')}")
+                return
+            r = self.roll_call("NCEI", dt.date(y, 1, 1))
+            st["roll"] = r
+            if not r.get("ok"):
+                self.error(f"NCEI {y} roll {r.get('status')}: {r.get('error')}")
+                return
+
+    def run_shard(self):
+        lane = self.lane
+        cfg = LANES[lane]
+        days = [dt.date.fromisoformat(x) for x in self.days_env.split(",") if x.strip()]
+        days.sort(reverse=True)
+        time.sleep(self.shard * 7 + random.random() * 5)          # stagger the shards' upstream hits
+        if lane == "OBS" and self.shard == 0 and "NCEI" in self.lanes:
+            self.ncei()
+        for d in days:
+            if (now() - self.started).total_seconds() > self.budget_s:
+                self.note("time budget used up"); break
+            if minutes_to_forbidden() < cfg["per_day"] + 3:
+                self.note("a forbidden window starts soon - stopping (frees the runner)"); break
+            if not self.dry:
+                try:
+                    busy = self.busy()
+                except Exception as e:
+                    busy = [f"busy check failed: {e}"]
+                if busy:
+                    self.note(f"yielding to feed workflows: {busy}"); break
+                if self.gate_db() == "stop":
+                    break
+                if self.ready(lane, d) or (self.cursor(lane) and d >= self.cursor(lane)):
                     continue
-                raise RuntimeError(f"lane {lane} is not contiguous with the archive: {blk}")
-            if best is None or d > best[1]:
-                best = (lane, d)
-        if best:
-            return "lane", best[0], best[1]
-        if waits:
-            return "wait", "; ".join(waits), None
-        return "done", None, None
+            extra = None
+            if lane == "OBS":
+                extra = {"TASKS": "dailies,peaks" if d >= LSR_EXISTS_FROM else "dailies,peaks,lsr"}
+            code, res, secs = self.run_feed(lane, str(d), extra)
+            ok, why = self.day_ok(lane, res, str(d))
+            self.steps.append({"lane": lane, "day": str(d), "exit": code, "seconds": secs, "ok": ok, "why": why,
+                               "feed": self.summarize_feed(res)})
+            if not ok:
+                k = self.fails(lane, d) + 1
+                self.error(f"{lane} {d}: {why} (failed run {k} of 3 for this day)")
+                if not self.dry:
+                    self.set_key(f"p5_fail_{lane.lower()}_{d}", str(k))
+                    if k >= 3:
+                        self.disable(f"{lane} {d} failed 3 runs: {why[:200]}")
+                continue
+            self.set_key(f"p5_ready_{lane.lower()}_{d}", "ok")
+            retries = (res or {}).get("write_retries") or 0
+            if retries:
+                w = min(300, 30 * retries) + random.random() * 30
+                self.note(f"{retries} write retries (DB pressure) - pausing {w:.0f}s")
+                time.sleep(w)
+            if self.shard == 0 and not self.dry:
+                self.roll_ready([lane])
 
     # ------------------------------------------------------------ main
     def main(self):
-        self.note(f"{'DRY RUN (nothing is written)' if self.dry else 'LIVE'}; lanes {self.lanes}; "
-                  f"feeds {self.feed_shas()}")
-        self.check_pins()
+        self.note(f"{'DRY RUN (nothing is written)' if self.dry else 'LIVE'}; mode {self.mode}")
+        if self.mode in ("plan", "shard"):
+            self.check_pins() if self.mode == "shard" else None
         if not self.dry and (os.environ.get("DATES") or flag("IGNORE_WINDOW")):
             raise RuntimeError("DATES / IGNORE_WINDOW are dry-run-only inputs")
-        dl = self.deadline()
-        if dl is None:
-            self.note(f"outside the quiet UTC windows {WINDOWS} (minutes) - nothing to do this run")
-            return 0
-        try:
-            busy = self.busy()
-        except Exception as e:
-            busy = [f"busy check failed: {type(e).__name__}: {e}"]
-        if busy:
-            if self.dry:
-                self.note(f"feed workflows active (dry run continues, nothing is written): {busy}")
-            else:
-                self.note(f"yielding to feed workflows: {busy}")
-                return 0
-        if not self.dry and not self.service:
-            self.disable("SUPABASE_SERVICE_ROLE_KEY secret missing (go-live step)")
-            raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not set")
         try:
             self.refresh_status()
         except Exception as e:
-            if "HTTP 404" in str(e):
-                self.disable(f"hz_p5_status_v1 missing - migration not applied ({str(e)[:120]})")
-            raise
-        if self.status:
-            self.note(f"DB {self.status['db_bytes'] / 2**30:.2f} GB, active {self.status['active']}, "
-                      f"archive starts {self.status.get('arch_min')}, cursors {self.status.get('cursors')}")
-
-        if self.dry and os.environ.get("DATES"):
-            for lane in self.lanes:
-                if lane == "NCEI":
-                    years = sorted({int(x.strip()[:4]) for x in os.environ["DATES"].split(",") if x.strip()},
-                                   reverse=True)
-                    for y in years:
-                        self.ncei_step(y)
-                    continue
-                days = sorted({dt.date.fromisoformat(x.strip()) for x in os.environ["DATES"].split(",") if x.strip()},
-                              reverse=True)
-                extra = {"TASKS": "dailies,peaks,lsr"} if lane == "OBS" else None
-                code, res, secs = self.run_feed(lane, ",".join(str(d) for d in sorted(days)), extra)
-                self.steps.append({"lane": lane, "dates": [str(d) for d in days], "exit": code, "seconds": secs,
-                                   "feed": self.summarize_feed(res), "dry_run": True,
-                                   "day_ok": {str(d): self.day_ok(res, str(d), True)[1] if res else None
-                                              for d in days} if lane != "OBS" else None})
-            return 1 if any((s.get("feed") or {}).get("status") == "error" or s.get("feed") is None
-                            for s in self.steps) else 0
-
-        while True:
-            kind, lane, val = self.plan_next()
-            if kind == "done":
-                if set(self.lanes) >= set(LANE_ORDER) | {"NCEI"}:
-                    self.note("STAGE 5 COMPLETE: every lane reached 2021-10-01 and NCEI 2021-2023 is loaded")
-                    self.disable("Stage 5 backfill complete")
-                else:
-                    self.note(f"lanes {self.lanes} are complete (other lanes not checked in this run)")
-                return 0
-            if kind == "wait":
-                print(f"::warning::stage5: {lane}", flush=True)
-                return 0
-            remaining = (dl - now()).total_seconds() / 60
-            if kind == "ncei":
-                if remaining < 20:
-                    break
-                ok, at, why = self.ncei_step(val)
+            if self.dry:
+                self.note(f"hz_p5_status_v1 unavailable: {str(e)[:160]}")
             else:
-                cfg = LANES[lane]
-                k = min(cfg["batch"], (val - FLOOR).days + 1, int((remaining - 5) // cfg["per_day"]))
-                if lane == "OBS" and val >= LSR_EXISTS_FROM:
-                    k = min(k, 1)               # 2024-07-21 alone (no lsr task)
-                if k < 1:
-                    break
-                days = [val - dt.timedelta(days=i) for i in range(k)]
-                if lane == "OBS":
-                    days = [d for d in days if d < LSR_EXISTS_FROM] or days[:1]
-                if not self.dry:
-                    try:
-                        busy = self.busy()
-                    except Exception as e:
-                        busy = [f"busy check failed: {e}"]
-                    if busy:
-                        self.note(f"yielding to feed workflows: {busy}")
-                        break
-                    st = self.refresh_status()
-                    if st["db_bytes"] > self.max_db * 2**30:
-                        self.disable(f"DB {st['db_bytes'] / 2**30:.2f} GB > {self.max_db} GB guard")
-                        raise RuntimeError("DB size guard")
-                    if st["active"] > self.max_active:
-                        self.note(f"DB busy ({st['active']} active backends) - yielding")
-                        break
-                ok, at, why = self.grid_or_obs_step(lane, days)
-            if ok:
-                if self.cursor("p5_fail"):
-                    self.set_fail("", 0)
-                if self.dry:
-                    self.note("DRY RUN: one planned step done; stopping (cursors do not move in a dry run)")
-                    break
-                self.refresh_status()
-                continue
-            n = self.fail_count(f"{lane}:{at}") + 1
-            self.error(f"{lane} step failed at {at}: {why} (attempt {n} of 3 for this day)")
-            self.set_fail(f"{lane}:{at}", n)
-            if n >= 3:
-                self.disable(f"{lane} {at} failed 3 runs in a row: {why}")
-            return 1
-        self.note("time budget / quiet window used up - the next scheduled run continues")
-        return 0
+                if "HTTP 404" in str(e):
+                    self.disable("hz_p5_status_v1 missing")
+                raise
+        if self.mode == "plan":
+            svc = self.service_check()
+            self.note(f"service-role key: {svc}")
+            if not self.dry and not svc.startswith("ok"):
+                self.disable(f"service-role key not usable: {svc}")
+                raise RuntimeError("service-role key")
+            if self.status:
+                self.note(f"DB {self.status['db_bytes'] / 2**30:.2f} GB, active {self.status['active']}, "
+                          f"archive starts {self.status.get('arch_min')}, cursors "
+                          f"{ {k: v for k, v in self.keys().items() if not k.startswith(('p5_ready', 'p5_fail'))} }")
+            try:
+                busy = self.busy(0)
+                self.note(f"feed workflows active: {busy or 'none'}")
+            except Exception as e:
+                self.note(f"busy check failed: {e}")
+            include, why = self.plan()
+            self.note(f"plan: {len(include)} shard job(s) ({why})")
+            mat = json.dumps({"include": include or [{"lane": "NONE", "shard": 0, "days": ""}]})
+            go = "true" if include else "false"
+            gho = os.environ.get("GITHUB_OUTPUT")
+            if gho:
+                with open(gho, "a") as fh:
+                    fh.write(f"matrix={mat}\ngo={go}\n")
+            print("PLAN " + mat, flush=True)
+            return 0
+        if self.mode == "shard":
+            if self.lane == "NONE":
+                return 0
+            self.run_shard()
+            return 1 if self.errors else 0
+        if self.mode == "roll":
+            if self.dry:
+                self.note("DRY RUN - roll step reads the state only")
+                for lane in LANE_ORDER:
+                    if self.status:
+                        self.note(f"{lane}: next roll day {self.next_roll_day(lane)}, ready {self.ready(lane, self.next_roll_day(lane))}")
+                return 0
+            n = self.roll_ready([l for l in LANE_ORDER if l in self.lanes])
+            self.note(f"rolled {n} day(s)")
+            return 1 if self.errors else 0
+        raise RuntimeError(f"unknown MODE {self.mode}")
 
     def finish(self, code):
-        res = {"status": "error" if (code or self.errors) else "ok", "dry_run": self.dry,
-               "run_id": self.run_id, "started_utc": self.started.isoformat(), "finished_utc": now().isoformat(),
-               "lanes": self.lanes, "steps": self.steps, "notes": self.notes, "errors": self.errors,
-               "disable": self.disable_reason, "status_db": self.status}
-        with open(os.path.join(self.sdir, "result.json"), "w") as fh:
+        res = {"status": "error" if (code or self.errors) else "ok", "dry_run": self.dry, "mode": self.mode,
+               "lane": self.lane, "shard": self.shard, "run_id": self.run_id,
+               "started_utc": self.started.isoformat(), "finished_utc": now().isoformat(),
+               "steps": self.steps, "rolled": self.rolled, "notes": self.notes, "errors": self.errors,
+               "disable": self.disable_reason}
+        with open(self.result_path, "w") as fh:
             json.dump(res, fh, indent=1, default=str)
         sp = os.environ.get("GITHUB_STEP_SUMMARY")
         if sp:
             with open(sp, "a") as fh:
-                fh.write(f"### Stage 5 backfill: {res['status']}{' (DRY RUN, nothing written)' if self.dry else ''}\n\n")
-                fh.write("| lane | dates | exit | s | feed status | rolled |\n|---|---|---|---|---|---|\n")
+                fh.write(f"### Stage 5 {self.mode} {self.lane} {self.shard}: {res['status']}"
+                         f"{' (DRY RUN)' if self.dry else ''}\n\n| lane | day | s | ok | why |\n|---|---|---|---|---|\n")
                 for s in self.steps:
-                    fh.write(f"| {s['lane']} | {s['dates']} | {s['exit']} | {s['seconds']} | "
-                             f"{(s.get('feed') or {}).get('status')} | "
-                             f"{', '.join(r['day'] + ':' + str(r['result'].get('status')) for r in s.get('rolled', []))} |\n")
-                for n in self.notes:
+                    fh.write(f"| {s['lane']} | {s['day']} | {s['seconds']} | {s.get('ok')} | {str(s.get('why') or '')[:120]} |\n")
+                fh.write(f"\nrolled: {[(r['lane'], r['day'], r['result'].get('status')) for r in self.rolled]}\n")
+                for n in self.notes + [f"**error** {e}" for e in self.errors]:
                     fh.write(f"- {n}\n")
-                for e in self.errors:
-                    fh.write(f"- **error** {e}\n")
         print("STAGE5_RESULT " + json.dumps(res, sort_keys=True, separators=(",", ":"), default=str), flush=True)
         return 1 if res["status"] == "error" else 0
 

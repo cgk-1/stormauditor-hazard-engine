@@ -1,47 +1,73 @@
 name: stage5-backfill
-# Archive Phase 5, Stage 5 - TEMPORARY, SELF-DISABLING backfill 2021-10-01 -> 2024-07 in v4
-# (owner-approved 2026-10-07: "yes do that workflow"; recorded in stormwatch-insight CLAUDE.md
-# AUTOMATION RULES and AI-HANDBOOK §36). Driver: stage5_backfill.py (read its docstring).
-# - Runs the feeds' OWN entrypoints (hail-feed + wind-feed main, this repo) with explicit dates,
-#   DAY_CONVENTION=v4, then rolls each backfilled grid day into the archive (hz_p5_roll_v1).
-# - Starts work only inside the quiet UTC windows 00:00-05:15, 05:45-08:30, 18:00-23:30 and never
-#   while a feed workflow is queued/running; small batches (<= 3 days, OBS <= 7); one run at a time.
-# - Disables ITSELF (GitHub API) when every lane reached 2021-10-01, on the 20 GB DB guard, or when
-#   the same day fails 3 runs in a row. The schedule exists only on the default branch.
-# - Manual runs are DRY RUNS unless dry_run=0 (nothing written: no feed write, roll or cursor).
+# Archive Phase 5, Stage 5 - TEMPORARY, SELF-DISABLING, PARALLEL backfill 2021-10-01 -> 2024-07 in v4
+# (owner-approved 2026-10-07: "yes do that workflow", "go, B", "make it MUCH faster"; recorded in
+# stormwatch-insight CLAUDE.md AUTOMATION RULES and AI-HANDBOOK §36). Driver: stage5_backfill.py.
+# plan -> parallel shard jobs (lane x shard, each runs the feeds' OWN entrypoints per day in v4 and
+# marks the day ready) -> roll (strictly contiguous archive roll; shard 0 of each lane also rolls).
+# Never works 05:15-05:45, 09:00-11:00, 11:50-12:30, 15:50-17:00 UTC; yields to any feed workflow;
+# backs off on DB load; disables ITSELF when complete, at the 20 GB DB guard, or on a 3rd failure of
+# one day. Manual runs are DRY RUNS unless dry_run=0. The schedule exists only on the default branch.
 on:
   schedule:
-    - cron: "7,37 0-4 * * *"
-    - cron: "52 5 * * *"
-    - cron: "22,52 6-7 * * *"
-    - cron: "7,37 18-22 * * *"
+    - cron: "4,34 * * * *"      # a new run starts as soon as the previous one ends (concurrency queue)
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "1 (default) = compute everything on the runner, write NOTHING. 0 = live (same as the schedule)."
-        default: "1"
-        required: false
-      dates:
-        description: "Dry run only: sample local dates (comma list), run for every lane in 'lanes' (NCEI uses their years)."
-        required: false
-      lanes:
-        description: "Comma list of HAIL,ANL,HRRR,OBS,NCEI (default: all)."
-        required: false
-      time_budget_min:
-        description: "Minutes of work per run (default 50; the quiet window end always wins)."
-        required: false
-      ignore_window:
-        description: "Dry run only: 1 = ignore the quiet-window gate."
-        required: false
+      dry_run: {description: "1 (default) = compute everything, write NOTHING. 0 = live.", default: "1", required: false}
+      dates: {description: "Dry run only: sample dates (comma list) dealt to the shards of every lane.", required: false}
+      lanes: {description: "Comma list of HAIL,ANL,HRRR,OBS,NCEI (default all).", required: false}
+      shards: {description: "Shards per lane, e.g. HAIL=1,ANL=9,HRRR=4,OBS=6 (default; 20 jobs).", required: false}
+      time_budget_min: {description: "Max minutes per shard job (default 300; the next forbidden window always wins).", required: false}
 permissions:
   actions: write      # self-disable (this workflow only) + read the feed repos' run status
   contents: read
-# One run at a time; a newer trigger waits (GitHub keeps one pending run per group).
 concurrency: {group: stage5-backfill, cancel-in-progress: false}
+env:
+  SUPABASE_URL: https://aozjsfjemobuzqrhxcxy.supabase.co
+  SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFvempzZmplbW9idXpxcmh4Y3h5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2NzMyODIsImV4cCI6MjEwMDI0OTI4Mn0.gYwwzMcT4VCuTyWHNXlm8viyeGOsv7isfNgegYAmcV8
+  # Live ONLY for the schedule or a dispatch with dry_run=0; anything else is a dry run.
+  RUN_MODE: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == '0')) && 'live' || 'dry' }}
+  DATES: ${{ github.event.inputs.dates }}
+  LANES: ${{ github.event.inputs.lanes }}
+  SHARDS: ${{ github.event.inputs.shards }}
+  TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '300' }}
+  MAX_DB_GB: "20"
+  MAX_ACTIVE: "14"
+  LOOKAHEAD: "150"
 jobs:
-  backfill:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      go: ${{ steps.plan.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - id: plan
+        env:
+          MODE: plan
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET_NEW }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          OUT_DIR: ${{ github.workspace }}/feed-out
+        run: python stage5_backfill.py
+      - name: Self-disable
+        if: always() && hashFiles('feed-out/stage5/DISABLE') != ''
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          echo "::warning::disabling stage5-backfill: $(cat feed-out/stage5/DISABLE)"
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/stage5-backfill.yml/disable"
+  shard:
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.lane }}-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4
         with: {path: hazard}
@@ -55,40 +81,54 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q libeccodes-dev
       - name: Python deps (wind-feed pins = the superset; the driver checks all three agree)
         run: pip install -r wind/requirements.txt
-      - name: Backfill
+      - name: Shard
         working-directory: hazard
         env:
-          SUPABASE_URL: https://aozjsfjemobuzqrhxcxy.supabase.co
-          SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFvempzZmplbW9idXpxcmh4Y3h5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2NzMyODIsImV4cCI6MjEwMDI0OTI4Mn0.gYwwzMcT4VCuTyWHNXlm8viyeGOsv7isfNgegYAmcV8
+          MODE: shard
+          LANE: ${{ matrix.lane }}
+          SHARD: ${{ matrix.shard }}
+          SHARD_DAYS: ${{ matrix.days }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET_NEW }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GH_TOKEN: ${{ github.token }}
-          # Live ONLY for the schedule or an explicit dispatch with dry_run=0; anything else is a dry run
-          # (the driver treats every RUN_MODE other than 'live' as a dry run).
-          RUN_MODE: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == '0')) && 'live' || 'dry' }}
-          DATES: ${{ github.event.inputs.dates }}
-          LANES: ${{ github.event.inputs.lanes }}
-          TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '50' }}
-          IGNORE_WINDOW: ${{ github.event.inputs.ignore_window }}
-          MAX_DB_GB: "20"
           HAIL_DIR: ${{ github.workspace }}/hail
           WIND_DIR: ${{ github.workspace }}/wind
           HAZARD_DIR: ${{ github.workspace }}/hazard
           OUT_DIR: ${{ github.workspace }}/feed-out
         run: python stage5_backfill.py
-      - name: Upload run record (driver result, FEED_RESULTs, quarantine records, dry-run payloads)
+      - name: Upload run record
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: feed-out-stage5-${{ github.run_id }}-${{ github.run_attempt }}
+          name: feed-out-stage5-${{ matrix.lane }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: feed-out
           if-no-files-found: ignore
-          retention-days: 30
-      - name: Self-disable (backfill complete, DB guard, or 3 failed runs on one day)
+          retention-days: 14
+      - name: Self-disable
         if: always() && hashFiles('feed-out/stage5/DISABLE') != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
+        env: {GH_TOKEN: "${{ github.token }}"}
         run: |
           echo "::warning::disabling stage5-backfill: $(cat feed-out/stage5/DISABLE)"
           gh api -X PUT "repos/${{ github.repository }}/actions/workflows/stage5-backfill.yml/disable"
-          echo "state: $(gh api "repos/${{ github.repository }}/actions/workflows/stage5-backfill.yml" --jq .state)"
+  roll:
+    needs: [plan, shard]
+    if: always() && needs.plan.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - env:
+          MODE: roll
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET_NEW }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          OUT_DIR: ${{ github.workspace }}/feed-out
+        run: python stage5_backfill.py
+      - name: Self-disable
+        if: always() && hashFiles('feed-out/stage5/DISABLE') != ''
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          echo "::warning::disabling stage5-backfill: $(cat feed-out/stage5/DISABLE)"
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/stage5-backfill.yml/disable"
