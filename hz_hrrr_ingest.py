@@ -39,10 +39,28 @@ payloads are byte-identical to the previous version on normal days:
   * DRY_RUN=1, DATE=YYYY-MM-DD|START..END, completeness summary and the
     FEED_RESULT json line: see feedguard.py.
 
+DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged):
+  * T1: every HRRR cell uses its OWN zone's local day (tzwin.py,
+    data/tz/tz_hrrr.npz); the zone windows are hours the state groups already
+    fetch (one shared hour cache); each cell takes its own window's max and
+    d40/d58 counts. hz_bg_coarse HRRR samples come from the same composite.
+  * T3: the window has the real number of local hours (23 on spring-forward,
+    25 on fall-back days) instead of always 24. p_hours = the state's own
+    zone window length.
+  * T7: hz_station_bg HRRR is written ONCE per date for every station (first
+    chunk deletes the date, the rest append) from the own-zone composite. v3
+    kept only the last tz group (Arizona).
+  * Hour alignment is kept as v3: the HRRR day is the 24 (23/25) hourly fields
+    ENDING at local 00:00 .. 23:00 (hrrr_hour(t) = hour ending t), i.e. local
+    23:00 D-1 .. 23:00 D. V4_HRRR_HOUR_ENDING=1 (dry runs only, owner decision
+    pending, report item T12) uses the hours ending 01:00 .. 24:00 instead.
+  * Test flags (DRY_RUN only): V4_ZONES=state, V4_DST=0 (see tzwin.py).
+
 Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Optional: DATE / INGEST_DATE (local dates; default yesterday), STATES,
           FLOOR_MPH (default 30; the workflows pass 35), DRY_RUN, FEED_OUT_DIR,
-          HZ_STATIONS_FILE (offline station list for dry runs)
+          HZ_STATIONS_FILE (offline station list for dry runs),
+          DAY_CONVENTION (v3|v4), V4_ZONES / V4_DST / V4_HRRR_HOUR_ENDING (dry runs)
 Deps: requirements.txt (exact pins)
 """
 import os, json, gzip, time, struct, hashlib, tempfile, datetime as dt
@@ -53,6 +71,7 @@ from shapely.geometry import shape, Point
 from shapely.prepared import prep
 
 import feedguard as fg
+import tzwin
 
 UA = {"User-Agent": "StormAuditor-HazardEngine/2.0"}
 UTC = dt.timezone.utc
@@ -280,14 +299,15 @@ def local_hours(tzname, local_date_str):
 HRRR_PUBLISH_GRACE_H = fg.env_float("HRRR_PUBLISH_GRACE_H", 12.0)
 
 
-def preflight(run, key, local_date, states, policy):
+def preflight(run, key, local_date, states, policy, need=None):
     """Every hour the day needs (24 per tz group) must have its f01 .idx
     published before anything is written. Scheduled runs (policy defer)
     defer the day while recent hours are missing; the next dispatch re-runs
     yesterday anyway (daily-new always ingests yesterday). In practice the
     last needed file (init 06Z, or 07Z in winter) lands ~1 h after its init,
     long before the 10:10Z dispatch."""
-    need = sorted({t for tz in {STATE_TZ[s] for s in states} for t in local_hours(tz, local_date)})
+    if need is None:
+        need = sorted({t for tz in {STATE_TZ[s] for s in states} for t in local_hours(tz, local_date)})
     missing = []
     for t in need:
         init = t - dt.timedelta(hours=1)
@@ -486,6 +506,231 @@ def process_local_date(run, local_date, states, policy="strict"):
     return stored
 
 
+# ===================================================================== v4
+# DAY_CONVENTION=v4 (Archive Phase 5 Stage 3). Used only when DAY_CONVENTION=v4.
+
+LOWER48_ZONE_IDS = range(1, 22)     # tz MANIFEST ids 1..21 = the lower-48 zones
+
+
+def v4_hours(window, zone, local_date, dst_fix=True, hour_ending=False):
+    """UTC hour-ending times of one zone window.
+    dst_fix (T3): the real consecutive UTC hours of the local day, start ..
+    end-1h (23/24/25). dst_fix=False reproduces v3 local_hours() exactly (24
+    wall-clock steps: on spring-forward days one UTC hour appears twice, on
+    fall-back days the repeated hour is skipped). hour_ending (T12): every
+    time +1 h (the hours ending 01:00 .. 24:00 local)."""
+    start, end = window
+    if dst_fix:
+        n = int(round((end - start).total_seconds() / 3600))
+        hours = [start + dt.timedelta(hours=h) for h in range(n)]
+    else:
+        hours = local_hours(zone, local_date)
+    if hour_ending:
+        hours = [t + dt.timedelta(hours=1) for t in hours]
+    return hours
+
+
+def max_over_hours(hours):
+    """Daily max (mph) + d40/d58 over the given hour-ending times (same math as
+    group_daily_max). Every hour must be present (raises otherwise)."""
+    dmax = d40 = d58 = None
+    for t in hours:
+        v = hrrr_hour(t)
+        mph = v * MS2MPH
+        if dmax is None:
+            dmax = mph.copy()
+            d40 = (mph >= 40).astype("int16")
+            d58 = (mph >= 58).astype("int16")
+        else:
+            np.fmax(dmax, mph, out=dmax)
+            d40 += (mph >= 40).astype("int16")
+            d58 += (mph >= 58).astype("int16")
+    return dmax, d40, d58, len(hours)
+
+
+def process_local_date_v4(run, local_date, states, policy="strict", flags=None, hour_ending=False):
+    flags = flags or {"zones": "real", "dst": True}
+    real = flags["zones"] == "real"
+    date_iso = f"{local_date[:4]}-{local_date[4:6]}-{local_date[6:]}"
+    key = date_iso
+    run.expect(key, "states", len(states))
+    zm = tzwin.zone_map("hrrr")
+    # Preflight over every lower-48 zone window (same hours as the state zones on CONUS).
+    dg48 = tzwin.DayGroups(local_date, LOWER48_ZONE_IDS)
+    need = sorted({t for g in range(len(dg48.groups))
+                   for t in v4_hours(dg48.groups[g], dg48.members[g][0], local_date, flags["dst"], hour_ending)}
+                  | {t for s in states for t in v4_hours(tzwin.local_window(STATE_TZ[s], local_date),
+                                                           STATE_TZ[s], local_date, flags["dst"], hour_ending)})
+    if not preflight(run, key, local_date, states, policy, need=need):
+        return 0
+    try:
+        stations = load_stations(run)
+    except Exception as e:
+        run.error(key, "HRRR station_bg", f"station list unavailable: {e}")
+        stations = None
+
+    st_zone = {st: tzwin.zone_id(STATE_TZ[st]) for st in states}
+    if real and _LATLON is None:      # grid lat/lon arrive with the first decoded field
+        try:
+            hrrr_hour(need[0])
+        except fg.FeedError:
+            pass
+    if real and _LATLON is None:
+        run.error(key, "HRRR grid", "no HRRR hour could be decoded")
+        return 0
+    st_zones = {}
+    for st in states:
+        zs = set()
+        if real:
+            la, lo = _LATLON
+            minx, miny, maxx, maxy = load_state_geom(st)[0].bounds
+            m = (lo >= minx) & (lo <= maxx) & (la >= miny) & (la <= maxy)
+            zs = set(np.unique(zm.zone[m]).tolist()) - {0}
+        st_zones[st] = zs | {st_zone[st]}
+    dg = tzwin.DayGroups(local_date, set().union(*st_zones.values()))
+    st_group = {st: tzwin.group_of_window(dg, tzwin.local_window(STATE_TZ[st], local_date)) for st in states}
+    st_groups = {st: sorted({int(dg.lut[z]) for z in st_zones[st]}) for st in states}
+    used_g = sorted({g for st in states for g in st_groups[st]})
+    run.day(key)["v4_groups"] = dg.describe()
+    run.expect(key, "tz_groups", len(used_g))
+
+    fields, failed_g = {}, {}
+    for g in used_g:
+        try:
+            rep = dg.members[g][0]
+            if not real:   # state mode: the group's state zone itself (v3 local_hours identity)
+                rep = next(STATE_TZ[s] for s in states if st_group[s] == g)
+            fields[g] = max_over_hours(v4_hours(dg.groups[g], rep, local_date, flags["dst"], hour_ending))
+            run.receive(key, "tz_groups")
+            run.set_received(key, f"hours {dg.members[g][0]}", fields[g][3])
+        except Exception as e:
+            failed_g[g] = f"{type(e).__name__}: {e}"
+            run.error(key, f"tz {dg.members[g][0]}", failed_g[g],
+                      details={"states": [s for s in states if g in st_groups[s]]})
+    la, lo = _LATLON if _LATLON is not None else (None, None)
+
+    cache = {}
+
+    def field_for(st):
+        """(dmax, d40, d58, candidate arrays, coarse arrays) for a state's cells."""
+        k = "comp" if real else st_group[st]
+        if k not in cache:
+            if real:
+                gmap = dg.lut[zm.zone]
+                ok = {g: f for g, f in fields.items()}
+                anyv = [np.max(np.stack([f[i] for f in ok.values()]), axis=0) for i in range(3)]
+                dmax = tzwin.compose(gmap, {g: f[0] for g, f in ok.items()}, anyv[0])
+                d40 = tzwin.compose(gmap, {g: f[1] for g, f in ok.items()}, anyv[1])
+                d58 = tzwin.compose(gmap, {g: f[2] for g, f in ok.items()}, anyv[2])
+                hours_cell = tzwin.compose(gmap, {g: np.full(dmax.shape, f[3], dtype="int16")
+                                                  for g, f in ok.items()}, 0)
+            else:
+                dmax, d40, d58, n = fields[k]
+                hours_cell = None
+            cg_v = dmax[::8, ::8]; cg_la = la[::8, ::8]; cg_lo = lo[::8, ::8]
+            cyy, cxx = np.where(cg_v >= 5)
+            ys, xs = np.where(dmax >= FLOOR)
+            cache[k] = {"dmax": dmax,
+                        "cand": (lo[ys, xs], la[ys, xs], dmax[ys, xs], d40[ys, xs], d58[ys, xs],
+                                 zm.zone[ys, xs], None if hours_cell is None else hours_cell[ys, xs]),
+                        "coarse": (cg_lo[cyy, cxx], cg_la[cyy, cxx], cg_v[cyy, cxx])}
+        return cache[k]
+
+    # T7: station backgrounds ONCE per date for every station, own-zone values.
+    if stations is not None:
+        try:
+            gset = {NAME2ABBR[s] for s in states}
+            rows = []
+            for stn in stations:
+                if stn.get("state") not in gset:
+                    continue
+                # the station's state decides which field (state mode) / composite (real)
+                st_name = next(n for n, a in NAME2ABBR.items() if a == stn["state"])
+                if st_name not in st_group:
+                    continue
+                if any(g in failed_g for g in (st_groups[st_name] if real else [st_group[st_name]])):
+                    raise fg.ValidationError(f"zone window for {stn['stid']} ({stn['state']}) unavailable")
+                dmax = field_for(st_name)["dmax"]
+                j = int(np.argmin((la - stn["lat"])**2 + (lo - stn["lon"])**2))
+                yy, xx = np.unravel_index(j, la.shape)
+                rows.append({"stid": stn["stid"], "bg": int(round(float(dmax[yy, xx])))})
+            if any(not (0 <= r["bg"] <= 300) for r in rows):
+                raise fg.ValidationError("station background outside 0-300 mph")
+            run.write(key, "HRRR station_bg",
+                      [("hz_station_bg_ingest",
+                        {"p_secret": run.secret, "p_date": date_iso, "p_src": "HRRR",
+                         "p_rows": rows[i:i+3000], "p_append": i > 0})
+                       for i in range(0, len(rows), 3000)])
+            run.receive(key, "station_bg_rows", len(rows))
+        except Exception as e:
+            run.error(key, "HRRR station_bg", f"{type(e).__name__}: {e}")
+
+    by_tz = {}
+    for st in states:
+        by_tz.setdefault(STATE_TZ[st], []).append(st)
+    stored = 0
+    for tzname, group_states in sorted(by_tz.items()):
+        for st in group_states:
+            bad = [g for g in (st_groups[st] if real else [st_group[st]]) if g in failed_g]
+            if bad:
+                run.day(key)["failed"].append(st)
+                continue
+            try:
+                geom, pg = load_state_geom(st)
+                minx, miny, maxx, maxy = geom.bounds
+                F = field_for(st)
+                c_lon, c_lat, c_v, c_d40, c_d58, c_zone, c_hours = F["cand"]
+                cg_lonv, cg_latv, cg_vv = F["coarse"]
+                own_hours = fields[st_group[st]][3]
+                m = ((c_lon >= minx) & (c_lon <= maxx) & (c_lat >= miny) & (c_lat <= maxy))
+                pts, max_h = [], own_hours
+                for i in np.where(m)[0]:
+                    x, y = float(c_lon[i]), float(c_lat[i])
+                    if pg.contains(Point(x, y)):
+                        if real and (int(c_zone[i]) == 0 or dg.lut[int(c_zone[i])] == tzwin.NO_GROUP):
+                            raise fg.ValidationError(f"{st}: stored cell {x:.3f},{y:.3f} has no US zone")
+                        if c_hours is not None:
+                            max_h = max(max_h, int(c_hours[i]))
+                        pts.append({"lon": round(x, 3), "lat": round(y, 3),
+                                    "v": int(round(float(c_v[i]))),
+                                    "d40": int(c_d40[i]),
+                                    "d58": int(c_d58[i])})
+                cm = ((cg_lonv >= minx) & (cg_lonv <= maxx) &
+                      (cg_latv >= miny) & (cg_latv <= maxy))
+                cpts = [{"lon": round(float(cg_lonv[i]), 2),
+                         "lat": round(float(cg_latv[i]), 2),
+                         "v": int(round(float(cg_vv[i])))}
+                        for i in np.where(cm)[0]
+                        if pg.contains(Point(float(cg_lonv[i]),
+                                             float(cg_latv[i])))]
+                validate_state(st, geom, pts, cpts, max_h)
+                calls = [("hz_bg_coarse_ingest",
+                          {"p_secret": run.secret, "p_date": date_iso,
+                           "p_src": "HRRR", "p_points": cpts[i:i+4000]})
+                         for i in range(0, len(cpts), 4000)]
+                calls += [("hz_hrrr_ingest",
+                           {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                            "p_hours": own_hours, "p_points": pts[i:i+4000],
+                            "p_append": i > 0})
+                          for i in range(0, len(pts), 4000)]
+                run.write(key, st, calls)
+                if not pts:
+                    run.empty(key, st)
+                    continue
+                run.written(key, st)
+                stored += 1
+                print(f"  {date_iso}  {st:16s} {len(pts)} HRRR cells >= "
+                      f"{FLOOR:.0f} mph ({own_hours} hrs{', ' + str(len(st_groups[st])) + ' zone windows' if len(st_groups[st]) > 1 else ''})")
+            except Exception as ex:
+                run.error(key, st, f"{type(ex).__name__}: {ex}")
+    for k, note in sorted(HOUR_NOTES.items()):
+        run.note(key, note)
+    HOUR_NOTES.clear()
+    if stored == 0 and not run.day(key)["failed"]:
+        print(f"{date_iso}: no HRRR wind >= {FLOOR:.0f} mph on land.")
+    return stored
+
+
 def parse_states():
     states_env = (os.environ.get("STATES") or "").strip()
     if not states_env:
@@ -506,10 +751,23 @@ def main(run):
     states = parse_states()
     run.meta.update({"boundary_md5": BOUNDARY_MD5, "floor_mph": FLOOR,
                      "numpy": np.__version__, "pygrib": pygrib.__version__})
-    print(f"HRRR ingest v2 (local-clock days): {len(dates)} date(s), "
-          f"{len(states)} state(s)")
+    conv = tzwin.convention()
+    flags = tzwin.test_flags(run.dry_run) if conv == "v4" else None
+    hour_ending = (os.environ.get("V4_HRRR_HOUR_ENDING") or "0").strip() == "1"
+    if hour_ending and (conv != "v4" or not run.dry_run):
+        raise fg.ValidationError("V4_HRRR_HOUR_ENDING=1 is a dry-run preview of plan item T12 "
+                                 "(owner decision pending); it needs DAY_CONVENTION=v4 and DRY_RUN=1")
+    run.meta["day_convention"] = conv
+    if conv == "v4":
+        run.meta.update({"tzwin_md5": tzwin.module_md5(), "zone_map_md5": tzwin.zone_map("hrrr").md5,
+                         "v4_flags": flags, "hour_ending": hour_ending})
+    print(f"HRRR ingest v2 ({conv} local-clock days): {len(dates)} date(s), "
+          f"{len(states)} state(s){f' {flags}' if flags else ''}{' [T12 hour-ending]' if hour_ending else ''}")
     for d in dates:
-        process_local_date(run, d, states, policy)
+        if conv == "v4":
+            process_local_date_v4(run, d, states, policy, flags, hour_ending)
+        else:
+            process_local_date(run, d, states, policy)
 
 
 if __name__ == "__main__":
