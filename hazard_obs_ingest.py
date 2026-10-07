@@ -482,7 +482,7 @@ def task_lsr_v4(run, key, d0, d1, rows):
 
 
 # ---------------------------------------------------------------------- ncei
-CZ_TZ_RE = re.compile(r"^([A-Z]{3,4})-?(\d{1,2})$")
+CZ_TZ_RE = re.compile(r"^([A-Z]{3,4})(-?)(\d{1,2})$")     # EST-5, CST-6, ..., GST10 (east of UTC)
 # Standard-time abbreviation -> DST-aware IANA zone, used ONLY for NCEI rows whose
 # point has no US zone (far offshore). Others (SST, GST, ...) keep the v3 date.
 CZ_FAMILY = {"EST": "America/New_York", "CST": "America/Chicago", "MST": "America/Denver",
@@ -496,12 +496,12 @@ def ncei_v4_row(row, cz):
     m = CZ_TZ_RE.match((cz or "").strip().upper())
     if not m:
         raise fg.ValidationError(f"event {row['event_id']}: CZ_TIMEZONE {cz!r} not understood")
-    off = int(m.group(2))
-    if not 3 <= off <= 11:
-        raise fg.ValidationError(f"event {row['event_id']}: CZ_TIMEZONE {cz!r} offset outside UTC-3..-11")
+    off = (-1 if m.group(2) else 1) * int(m.group(3))          # standard UTC offset, e.g. -6
+    if not -11 <= off <= 12:
+        raise fg.ValidationError(f"event {row['event_id']}: CZ_TIMEZONE {cz!r} offset outside UTC-11..+12")
     b = row["begin_utc"]          # v3 name; really LOCAL STANDARD time YYYYMMDDHHMM
     local = dt.datetime(int(b[:4]), int(b[4:6]), int(b[6:8]), int(b[8:10]), int(b[10:12]))
-    utc = (local + dt.timedelta(hours=off)).replace(tzinfo=UTC)
+    utc = (local - dt.timedelta(hours=off)).replace(tzinfo=UTC)
     import tzpoint
     z, src = _tz_lookup().at(row["lat"], row["lon"]), "point"
     if not z:
