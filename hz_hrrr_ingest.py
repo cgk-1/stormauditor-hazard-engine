@@ -612,18 +612,20 @@ def process_local_date_v4(run, local_date, states, policy="strict", flags=None, 
     cache = {}
 
     def field_for(st):
-        """(dmax, d40, d58, candidate arrays, coarse arrays) for a state's cells."""
-        k = "comp" if real else st_group[st]
+        """(dmax, d40, d58, candidate arrays, coarse arrays) for a state's cells.
+        Real mode: every cell takes its own zone's window; cells with no US zone
+        (never stored) keep the state's own window (= v3). One composite per
+        state window group."""
+        k = ("comp", st_group[st]) if real else st_group[st]
         if k not in cache:
             if real:
                 gmap = dg.lut[zm.zone]
-                ok = {g: f for g, f in fields.items()}
-                anyv = [np.max(np.stack([f[i] for f in ok.values()]), axis=0) for i in range(3)]
-                dmax = tzwin.compose(gmap, {g: f[0] for g, f in ok.items()}, anyv[0])
-                d40 = tzwin.compose(gmap, {g: f[1] for g, f in ok.items()}, anyv[1])
-                d58 = tzwin.compose(gmap, {g: f[2] for g, f in ok.items()}, anyv[2])
+                own = fields[st_group[st]]
+                dmax = tzwin.compose(gmap, {g: f[0] for g, f in fields.items()}, own[0])
+                d40 = tzwin.compose(gmap, {g: f[1] for g, f in fields.items()}, own[1])
+                d58 = tzwin.compose(gmap, {g: f[2] for g, f in fields.items()}, own[2])
                 hours_cell = tzwin.compose(gmap, {g: np.full(dmax.shape, f[3], dtype="int16")
-                                                  for g, f in ok.items()}, 0)
+                                                  for g, f in fields.items()}, own[3])
             else:
                 dmax, d40, d58, n = fields[k]
                 hours_cell = None
