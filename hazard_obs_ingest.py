@@ -461,13 +461,25 @@ def task_lsr_v4(run, key, d0, d1, rows):
         tail, bad, _rep, _k, _o = lsr_rows(hdr, rdr)
         if bad:
             run.warn(key, f"{len(bad)} wind/hail LSR tail row(s) could not be read (quarantined)")
+        import tzpoint
         seen = {json.dumps(r, sort_keys=True) for r in rows}
-        out, by_src = [], {"point": 0, "state": 0}
+        out, by_src, misfit = [], {"point": 0, "state": 0}, []
         for r in rows + [r for r in tail if json.dumps(r, sort_keys=True) not in seen]:
             z, src, ld = lsr_local(r)
             if d0 <= ld <= d1:
                 out.append(dict(r, date=ld.isoformat(), tz=z, tz_src=src))
                 by_src[src] += 1
+                t = r["time_utc"]
+                u = dt.datetime(int(t[:4]), int(t[4:6]), int(t[6:8]), int(t[8:10]), int(t[10:12] or 0), tzinfo=UTC)
+                if src == "point" and not tzpoint.zone_fits_state(z, r["state"], u):
+                    misfit.append(f"{r['city']} {r['state']} {r['lat']},{r['lon']} -> {z}")
+        if misfit:
+            # The report's coordinates are in a zone its state does not have (upstream
+            # coordinate error, e.g. 2026-06-07 '3 SE Dwtn Spearfish SD' at 36.61,-118.21).
+            # Kept with the zone of the point where it is plotted; listed loudly.
+            run.warn(key, f"lsr v4: {len(misfit)} report(s) whose coordinates lie in a zone their "
+                          f"state does not have (dated by the plotted point): {misfit[:5]}")
+            run.set_received(key, "lsr_v4_zone_not_in_state", len(misfit))
         run.set_received(key, "lsr_v4_rows", len(out))
         run.set_received(key, "lsr_v4_tail_rows", len(tail))
         run.set_received(key, "lsr_v4_state_fallback", by_src["state"])

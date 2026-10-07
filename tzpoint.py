@@ -57,6 +57,32 @@ STATE_TZ_DB = {
 }
 
 
+STATE_ZONES_FILE = os.path.join(HERE, "data", "tz", "state_zones.json")
+STATE_ZONES_MD5 = "e71c09877b4918321b8e492034e7f677"   # from docs/tz-county-table.csv (iana + iana_minor)
+_STATE_ZONES = None
+
+
+def zone_fits_state(iana, state, at_utc):
+    """True when `iana` has the same UTC offset at `at_utc` as at least one zone that
+    occurs in `state`'s counties (county table: majority + minor zones). States not
+    in the table (GU, AS, marine codes...) always fit. A False means the report's
+    coordinates are probably not in its state (upstream error): flag it."""
+    global _STATE_ZONES
+    if _STATE_ZONES is None:
+        with open(STATE_ZONES_FILE, "rb") as fh:
+            raw = fh.read()
+        if hashlib.md5(raw).hexdigest() != STATE_ZONES_MD5:
+            raise fg.ValidationError("state_zones.json md5 mismatch")
+        _STATE_ZONES = json.loads(raw)
+    zs = _STATE_ZONES.get((state or "").upper())
+    if not zs:
+        return True
+    from zoneinfo import ZoneInfo
+    naive = at_utc.replace(tzinfo=None)
+    off = ZoneInfo(iana).utcoffset(naive)
+    return any(ZoneInfo(z).utcoffset(naive) == off for z in zs)
+
+
 def state_tz_db(state):
     """hz_state_tz(state): upper-cased lookup, 'UTC' for anything else."""
     return STATE_TZ_DB.get((state or "").upper(), "UTC")
