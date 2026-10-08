@@ -560,6 +560,27 @@ class Driver:
                 self.error(f"NCEI {y} roll {r.get('status')}: {r.get('error')}")
                 return
 
+    def wait_feeds(self, busy, per_day):
+        """Yield to feed workflows by WAITING (no work, no DB load) until they finish, then carry on.
+        Quitting the run instead (before 2026-10-08) stranded the lane: a shard that left while holding
+        the lane's next roll day blocked every other shard of that lane until the run ended."""
+        self.note(f"yielding to feed workflows (waiting): {busy}")
+        waited = 0
+        while busy:
+            if waited >= 40 * 60 or (now() - self.started).total_seconds() > self.budget_s \
+                    or minutes_to_forbidden() < per_day + 3:
+                self.note(f"feed workflows still active after {waited // 60} min - stopping: {busy}")
+                return False
+            w = 110 + random.randint(0, 20)      # 20 shards x 3 repos: stay far below the API rate limit
+            time.sleep(w)
+            waited += w
+            try:
+                busy = self.busy(0)
+            except Exception as e:
+                busy = [f"busy check failed: {e}"]
+        self.note(f"feed workflows done after {waited // 60} min - resuming")
+        return True
+
     def wait_for_roll(self, lane, d):
         """HARD cap: day d may be ingested only while it is < MAX_AHEAD days ahead of the
         lane's next roll day. Otherwise roll what is ready and wait (<= 15 min), else False."""
@@ -602,8 +623,8 @@ class Driver:
                     busy = self.busy()
                 except Exception as e:
                     busy = [f"busy check failed: {e}"]
-                if busy:
-                    self.note(f"yielding to feed workflows: {busy}"); break
+                if busy and not self.wait_feeds(busy, cfg["per_day"]):
+                    break
                 if self.gate_db() == "stop":
                     break
                 if self.ready(lane, d) or (self.cursor(lane) and d >= self.cursor(lane)):
