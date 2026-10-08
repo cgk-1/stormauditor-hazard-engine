@@ -7,9 +7,10 @@ name: stage5-backfill
 # Never works 05:15-05:45, 09:00-11:00, 11:50-12:30, 15:50-17:00 UTC; yields to any feed workflow;
 # backs off on DB load; disables ITSELF when complete, at the 20 GB DB guard, or on a 3rd failure of
 # one day. Manual runs are DRY RUNS unless dry_run=0. The schedule exists only on the default branch.
+# Each live run ends with the chain job (stage5_chain.py), which dispatches the next live run.
 on:
   schedule:
-    - cron: "4,34 * * * *"      # a new run starts as soon as the previous one ends (concurrency queue)
+    - cron: "4,34 * * * *"      # never fired (10-08); the chain job below starts each next run
   workflow_dispatch:
     inputs:
       dry_run: {description: "1 (default) = compute everything, write NOTHING. 0 = live.", default: "1", required: false}
@@ -134,3 +135,23 @@ jobs:
         run: |
           echo "::warning::disabling stage5-backfill: $(cat feed-out/stage5/DISABLE)"
           gh api -X PUT "repos/${{ github.repository }}/actions/workflows/stage5-backfill.yml/disable"
+  chain:
+    # Self-chain (owner 2026-10-08 "self-chain it"): the :04/:34 schedule never fired, so the last job
+    # of every LIVE, non-cancelled run starts the next live run (stage5_chain.py: waits out forbidden
+    # windows, stops when the workflow is disabled/complete or after 3 failed runs in a row).
+    # Stop the backfill = disable the workflow (or cancel the running run).
+    needs: [plan, shard, roll]
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event.inputs.dry_run == '0') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          SHARD_RESULT: ${{ needs.shard.result }}
+          ROLL_RESULT: ${{ needs.roll.result }}
+          PLAN_GO: ${{ needs.plan.outputs.go }}
+        run: python stage5_chain.py
