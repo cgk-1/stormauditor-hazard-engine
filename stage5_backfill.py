@@ -87,8 +87,8 @@ def now():
 
 
 def shard_counts():
-    """SHARDS env 'HAIL=1,ANL=9,HRRR=4,OBS=6' (defaults = 20 parallel jobs)."""
-    out = {"HAIL": 1, "ANL": 9, "HRRR": 4, "OBS": 6}
+    """SHARDS env HAIL=1,ANL=9,HRRR=3,OBS=7 (defaults = 20 parallel jobs)."""
+    out = {"HAIL": 1, "ANL": 9, "HRRR": 3, "OBS": 7}   # balanced by the run-1 rates (days/h per shard)
     for tok in (os.environ.get("SHARDS") or "").split(","):
         if "=" in tok:
             k, v = tok.split("=", 1)
