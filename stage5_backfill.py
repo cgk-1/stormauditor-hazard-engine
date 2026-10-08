@@ -642,7 +642,7 @@ class Driver:
                 w = min(300, 30 * retries) + random.random() * 30
                 self.note(f"{retries} write retries (DB pressure) - pausing {w:.0f}s")
                 time.sleep(w)
-            if not self.dry:
+            if not self.dry and self.shard == 0:      # one roller per lane (others roll only while waiting on the cap)
                 self.roll_ready([lane])
 
     # ------------------------------------------------------------ progress
