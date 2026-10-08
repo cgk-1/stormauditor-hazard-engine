@@ -163,14 +163,17 @@ def task_stations(run):
 
 
 # ------------------------------------------------------------------- dailies
+MAX_GUST_MPH = 250.0   # physical cap for station gusts (same rule as hz_station_peak / v4 dailies)
+
+
 def parse_daily_csv(st, text, d0, d1):
-    """-> (rows, notes). Raises ValidationError on an unexpected reply."""
+    """-> (rows, notes, over_250). Raises ValidationError on an unexpected reply."""
     lines = text.splitlines()
     if st in EMPTY_NETWORKS and (not lines or lines[0].startswith("ERROR: Invalid network")):
-        return [], f"{st}: no IEM ASOS network (expected empty)"
+        return [], f"{st}: no IEM ASOS network (expected empty)", []
     if not lines or lines[0].strip() != DAILY_HEADER:
         raise fg.ValidationError(f"daily.py {st}: unexpected reply {text[:100]!r}")
-    rows, high = [], []
+    rows, high, over = [], [], []
     for line in lines[1:]:
         p = line.split(",")
         if len(p) != 4:
@@ -183,13 +186,18 @@ def parse_daily_csv(st, text, d0, d1):
             mph = float(p[2]) * KT2MPH
         except ValueError:
             raise fg.ValidationError(f"daily.py {st}: non-numeric gust in {line[:80]!r}") from None
+        if mph > MAX_GUST_MPH:
+            # Owner 2026-10-08 ("exclude 250"): a gust above 250 mph is not physical (mis-keyed
+            # METAR / sensor fault). Never stored, so the engine never reads it; quarantined.
+            over.append({"stid": p[0], "date": p[1], "gust_mph": round(mph, 1)})
+            continue
         if mph >= 3:   # store the full field: low gusts are
                        # valid OA evidence (they temper hot backgrounds)
             rows.append({"stid": p[0], "date": p[1],
                          "gust_mph": round(mph, 1)})
             if mph > 200:
                 high.append(f"{p[0]} {p[1]} {mph:.0f} mph")
-    return rows, (f"{st}: suspicious gusts kept as reported: {high[:5]}" if high else None)
+    return rows, (f"{st}: suspicious gusts kept as reported: {high[:5]}" if high else None), over
 
 
 def task_dailies(run, d0, d1):
@@ -202,7 +210,11 @@ def task_dailies(run, d0, d1):
                f"&year2={d1.year}&month2={d1.month}&day2={d1.day}"
                f"&var=max_wind_gust_kts&format=csv&na=blank")
         try:
-            got, note = parse_daily_csv(st, _get(url, timeout=300), d0, d1)
+            got, note, over = parse_daily_csv(st, _get(url, timeout=300), d0, d1)
+            if over:
+                path = run.quarantine(key, f"daily v3 range {st}", f"gust > {MAX_GUST_MPH:g} mph (not written)", over)
+                run.warn(key, f"dailies {st}: {len(over)} station-day(s) > {MAX_GUST_MPH:g} mph NOT written "
+                              f"(quarantine {path}): {[(r['stid'], r['date'], r['gust_mph']) for r in over[:5]]}")
             if note and "suspicious" in note:
                 run.warn(key, note)
             elif note:
