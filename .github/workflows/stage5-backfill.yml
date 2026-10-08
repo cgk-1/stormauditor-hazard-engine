@@ -32,7 +32,7 @@ env:
   TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '300' }}
   MAX_DB_GB: "20"
   MAX_ACTIVE: "14"
-  LOOKAHEAD: "150"
+  LOOKAHEAD: "400"   # candidate days per lane per run (NOT raw in flight: MAX_AHEAD caps that)
   MAX_AHEAD: "12"
   PAUSE_DB_GB: "20"   # owner 2026-10-08: no soft pause; 20 GB = stop + investigate
 jobs:
