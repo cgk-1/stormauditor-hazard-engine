@@ -110,6 +110,11 @@ NCEI_TYPES = {"Thunderstorm Wind":"wind","High Wind":"wind","Marine Thunderstorm
               "Hurricane (Typhoon)":"wind","Tropical Storm":"wind"}
 DAILY_HEADER = "station,day,max_wind_gust_kts,network"
 DAILIES_MIN_ROWS_PER_DAY = fg.env_float("DAILIES_MIN_ROWS_PER_DAY", 800)   # observed 1,452-1,715
+# v4 dailies come from METAR gust/PK WND remarks only, which stations report only when it is gusty:
+# on calm days the count is legitimately far below the IEM daily count (2024-01-23: 725 station-days
+# with all 49 networks answering, reproduced; 01-24 839, 01-25 891). With EVERY network answered, a
+# count between V4_DAILY_HARD_MIN and 800 is a warning (written); below the hard floor nothing is written.
+V4_DAILY_HARD_MIN = fg.env_float("V4_DAILY_HARD_MIN", 300)
 
 
 def _get(url, timeout=120, retries=5, binary=False):
@@ -296,10 +301,14 @@ def task_peaks(run, d0, d1, v4=False):
                               f"(quarantine {path}): {[(r.get('stid'), r.get('gust_mph')) for r in bad_v4[:5]]}")
             if v4_fail:
                 pass          # error already recorded; the v4 daily of this day is NOT written
-            elif len(v4_rows) < DAILIES_MIN_ROWS_PER_DAY:
+            elif len(v4_rows) < V4_DAILY_HARD_MIN:
                 run.error(key, "daily v4", f"only {len(v4_rows)} station-day gusts (< "
-                                           f"{DAILIES_MIN_ROWS_PER_DAY:.0f}): nothing written")
+                                           f"{V4_DAILY_HARD_MIN:.0f}): nothing written")
             else:
+                if len(v4_rows) < DAILIES_MIN_ROWS_PER_DAY:
+                    run.warn(key, f"daily v4: only {len(v4_rows)} station-day METAR gusts (< "
+                                  f"{DAILIES_MIN_ROWS_PER_DAY:.0f}) with all {len(CONUS)} networks answering "
+                                  f"(calm day); written")
                 run.write(key, "hz_station_daily_v4",
                           [("hz_station_daily_ingest_v4",
                             {"p_secret": run.secret, "p_d0": key, "p_d1": key,
