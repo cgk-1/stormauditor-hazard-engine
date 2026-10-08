@@ -130,7 +130,7 @@ class Driver:
         self.max_active = int(os.environ.get("MAX_ACTIVE") or 14)
         self.lookahead = int(os.environ.get("LOOKAHEAD") or 150)     # candidate list length per lane (plan)
         self.max_ahead = int(os.environ.get("MAX_AHEAD") or 12)      # HARD cap: un-rolled raw days per lane
-        self.pause_db = float(os.environ.get("PAUSE_DB_GB") or 17)   # soft pause (ingest waits / stops)
+        self.pause_db = float(os.environ.get("PAUSE_DB_GB") or 20)   # owner 2026-10-08: no soft pause below the 20 GB guard
         self.lanes = [x.strip().upper() for x in (os.environ.get("LANES") or "HAIL,ANL,HRRR,OBS,NCEI").split(",")
                       if x.strip()]
         self.lane = (os.environ.get("LANE") or "").strip().upper()

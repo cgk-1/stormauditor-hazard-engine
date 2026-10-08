@@ -34,7 +34,7 @@ env:
   MAX_ACTIVE: "14"
   LOOKAHEAD: "150"
   MAX_AHEAD: "12"
-  PAUSE_DB_GB: "17"
+  PAUSE_DB_GB: "20"   # owner 2026-10-08: no soft pause; 20 GB = stop + investigate
 jobs:
   plan:
     runs-on: ubuntu-24.04
