@@ -64,7 +64,7 @@ LANES = {
     "HRRR": {"repo": "HAZARD_DIR", "script": "hz_hrrr_ingest.py", "ceil": dt.date(2024, 7, 24),
              "srcs": ["HRRR", "BGH"], "per_day": 2.5, "timeout": 30, "env": {"FLOOR_MPH": "35"}},
     "OBS": {"repo": "HAZARD_DIR", "script": "hazard_obs_ingest.py", "ceil": dt.date(2024, 7, 21),
-            "srcs": [], "per_day": 3.5, "timeout": 30},
+            "srcs": [], "per_day": 3.5, "timeout": 45},     # 45: IEM HTTP 429 throttling (10-08) stretched days past 30
 }
 LANE_ORDER = ["HAIL", "ANL", "HRRR", "OBS"]
 LSR_EXISTS_FROM = dt.date(2024, 7, 21)          # hz_lsr already holds 2024-07-21: never re-pulled
@@ -88,7 +88,7 @@ def now():
 
 def shard_counts():
     """SHARDS env HAIL=2,ANL=8,HRRR=4,OBS=6 (defaults = 20 parallel jobs)."""
-    out = {"HAIL": 2, "ANL": 8, "HRRR": 4, "OBS": 6}   # balanced by run-2 rates: ~13 ANL, ~28 HRRR, ~70 HAIL, ~17 OBS days/h per shard
+    out = {"HAIL": 2, "ANL": 8, "HRRR": 4, "OBS": 4}   # OBS 6 -> 4 (10-08): 6 parallel IEM clients drew HTTP 429s   # balanced by run-2 rates: ~13 ANL, ~28 HRRR, ~70 HAIL, ~17 OBS days/h per shard
     for tok in (os.environ.get("SHARDS") or "").split(","):
         if "=" in tok:
             k, v = tok.split("=", 1)

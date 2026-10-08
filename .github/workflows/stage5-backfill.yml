@@ -16,7 +16,7 @@ on:
       dry_run: {description: "1 (default) = compute everything, write NOTHING. 0 = live.", default: "1", required: false}
       dates: {description: "Dry run only: sample dates (comma list) dealt to the shards of every lane.", required: false}
       lanes: {description: "Comma list of HAIL,ANL,HRRR,OBS,NCEI (default all).", required: false}
-      shards: {description: "Shards per lane, e.g. HAIL=2,ANL=8,HRRR=4,OBS=6 (default; 20 jobs).", required: false}
+      shards: {description: "Shards per lane, e.g. HAIL=2,ANL=8,HRRR=4,OBS=4 (default; 18 jobs).", required: false}
       time_budget_min: {description: "Max minutes per shard job (default 300; the next forbidden window always wins).", required: false}
 permissions:
   actions: write      # self-disable (this workflow only) + read the feed repos' run status
