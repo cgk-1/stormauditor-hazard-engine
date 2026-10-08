@@ -283,6 +283,17 @@ def task_peaks(run, d0, d1, v4=False):
             if disagree:
                 run.note(key, f"daily v4: {len(disagree)} station(s) whose IEM zone has another UTC offset "
                               f"than their point zone (point zone used): {disagree[:8]}")
+            # A station-day whose METAR max is outside the table's physical range (0-250 mph; e.g. a
+            # mis-keyed "G260KT" METAR) would make hz_station_daily_ingest_v4 reject the WHOLE day.
+            # Same rule as hz_station_peak (which drops > 250 mph with a warning): quarantine the
+            # row (record + warning) and write the rest. (Stage 5, 2026-10-08: IFP 2024-06-28 266 mph,
+            # NQX 2024-06-17 260 mph.)
+            bad_v4 = [r for r in v4_rows if not (0 <= float(r.get("gust_mph") or 0) <= 250)]
+            if bad_v4:
+                v4_rows = [r for r in v4_rows if 0 <= float(r.get("gust_mph") or 0) <= 250]
+                path = run.quarantine(key, "daily v4 range", "gust outside 0-250 mph (not written)", bad_v4)
+                run.warn(key, f"daily v4: {len(bad_v4)} station-day(s) outside 0-250 mph NOT written "
+                              f"(quarantine {path}): {[(r.get('stid'), r.get('gust_mph')) for r in bad_v4[:5]]}")
             if v4_fail:
                 pass          # error already recorded; the v4 daily of this day is NOT written
             elif len(v4_rows) < DAILIES_MIN_ROWS_PER_DAY:

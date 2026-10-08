@@ -128,7 +128,9 @@ class Driver:
         self.budget_s = 60 * float(os.environ.get("TIME_BUDGET_MIN") or 300)
         self.max_db = float(os.environ.get("MAX_DB_GB") or 20)
         self.max_active = int(os.environ.get("MAX_ACTIVE") or 14)
-        self.lookahead = int(os.environ.get("LOOKAHEAD") or 150)
+        self.lookahead = int(os.environ.get("LOOKAHEAD") or 150)     # candidate list length per lane (plan)
+        self.max_ahead = int(os.environ.get("MAX_AHEAD") or 12)      # HARD cap: un-rolled raw days per lane
+        self.pause_db = float(os.environ.get("PAUSE_DB_GB") or 17)   # soft pause (ingest waits / stops)
         self.lanes = [x.strip().upper() for x in (os.environ.get("LANES") or "HAIL,ANL,HRRR,OBS,NCEI").split(",")
                       if x.strip()]
         self.lane = (os.environ.get("LANE") or "").strip().upper()
@@ -289,13 +291,15 @@ class Driver:
             if st["db_bytes"] > self.max_db * 2**30:
                 self.disable(f"DB {st['db_bytes'] / 2**30:.2f} GB > {self.max_db} GB guard")
                 raise RuntimeError("DB size guard")
-            if st["active"] <= self.max_active:
+            gb = st["db_bytes"] / 2**30
+            if st["active"] <= self.max_active and gb <= self.pause_db:
                 return None
             if waited >= 600:
-                self.note(f"DB busy ({st['active']} active backends) for 10 min - stopping this job")
+                self.note(f"DB busy ({st['active']} active backends, {gb:.2f} GB) for 10 min - stopping this job")
                 return "stop"
             w = 30 + random.random() * 60
-            self.note(f"DB busy ({st['active']} active > {self.max_active}) - backing off {w:.0f}s")
+            self.note(f"DB busy ({st['active']} active > {self.max_active} or {gb:.2f} GB > soft "
+                      f"{self.pause_db} GB) - backing off {w:.0f}s")
             time.sleep(w)
             waited += w
 
@@ -354,9 +358,34 @@ class Driver:
                           f"{[e.get('msg', '')[:160] for e in res.get('errors', [])][:3]}"
         if not self.dry:
             pc = (d.get("redo") or {}).get("postcheck")
-            if not (isinstance(pc, dict) and pc.get("ok")):
-                return False, f"redo post-write check not ok: {pc}"
+            if isinstance(pc, dict) and not pc.get("ok"):
+                return False, f"redo post-write counts differ: {pc.get('diffs')}"
+            if not isinstance(pc, dict):
+                # the feed could not READ the counts (anon 3 s under load): re-check here, with backoff
+                ok, why = self.recheck_counts(lane, key, d)
+                if not ok:
+                    return False, f"redo post-write check: feed said {str(pc)[:120]}; recheck {why}"
+                d.setdefault("redo", {})["recheck"] = why
         return True, "ok"
+
+    def recheck_counts(self, lane, key, d):
+        rows = d.get("rows") or {}
+        exp = {"HAIL": {"hail_points": rows.get("ingest_points.p_points", 0)},
+               "ANL": {"wind_points": rows.get("ingest_wind_points.p_points", 0),
+                       "hz_station_bg": rows.get("hz_station_bg_ingest.p_rows", 0)},
+               "HRRR": {"hz_hrrr_points": rows.get("hz_hrrr_ingest.p_points", 0),
+                        "hz_station_bg": rows.get("hz_station_bg_ingest.p_rows", 0)}}[lane]
+        last = None
+        for attempt in range(6):
+            try:
+                live = self.rpc_anon("hz_redo_counts", {"p_secret": self.secret, "p_src": lane, "p_date": key})
+                diffs = {t: {"live": (live or {}).get(t), "payload": n} for t, n in exp.items()
+                         if (live or {}).get(t) != n}
+                return (not diffs), ("ok " + json.dumps(exp)) if not diffs else f"differs {diffs}"
+            except Exception as e:
+                last = str(e)[:160]
+                time.sleep(20 * (attempt + 1) + random.random() * 20)
+        return False, f"unreadable after retries: {last}"
 
     @staticmethod
     def summarize_feed(res):
@@ -415,19 +444,41 @@ class Driver:
                 if minutes_to_forbidden() < 2:
                     return n
                 r = self.roll_call(lane, d)
+                for attempt in range(6):           # transient: lock/statement timeout, 5xx, network
+                    err = str(r.get("error"))
+                    if r.get("ok") or r.get("status") != "http" or not any(
+                            x in err for x in ("55P03", "57014", "HTTP 5", "HTTP None", "Timeout", "timed out",
+                                               "Connection", "URLError")):
+                        break
+                    w = 10 * (attempt + 1) + random.random() * 10
+                    self.note(f"roll {lane} {d}: transient {err[:120]} - retry in {w:.0f}s")
+                    time.sleep(w)
+                    self.refresh_status()
+                    if self.next_roll_day(lane) != d:   # another roller finished it meanwhile
+                        r = {"ok": True, "status": "rolled_elsewhere"}
+                        break
+                    r = self.roll_call(lane, d)
                 self.rolled.append({"lane": lane, "day": str(d), "result": r})
                 if not r.get("ok"):
                     err = str(r.get("error"))
                     if r.get("status") == "refused" and "is not the next one" in err:
                         self.refresh_status()          # another roller got there first
                         continue
+                    if r.get("status") == "http":       # still transient after retries: not the day's fault
+                        self.error(f"roll {lane} {d}: transient error persisted ({err[:160]}); next run retries")
+                        break
                     k = self.fails(lane, d) + 1
                     self.error(f"roll {lane} {d} {r.get('status')}: {err} (attempt {k} of 3)")
                     self.set_key(f"p5_fail_{lane.lower()}_{d}", str(k))
+                    self.set_key(f"p5_issue_{lane.lower()}_{d}", json.dumps(
+                        {"why": f"roll {r.get('status')}: {err[:250]}", "attempts": k, "run": self.run_id,
+                         "at": now().isoformat()[:16]}))
                     self.set_key(f"p5_ready_{lane.lower()}_{d}", "")     # re-ingest it
                     if k >= 3:
                         self.disable(f"roll {lane} {d} failed 3 times: {err[:200]}")
                     break
+                if r.get("status") == "rolled_elsewhere":
+                    continue
                 n += 1
                 if r.get("status") == "rolled_warn":
                     print(f"::warning::stage5 {lane} {d}: row count outside 0.2x-5x of the recent median "
@@ -509,6 +560,28 @@ class Driver:
                 self.error(f"NCEI {y} roll {r.get('status')}: {r.get('error')}")
                 return
 
+    def wait_for_roll(self, lane, d):
+        """HARD cap: day d may be ingested only while it is < MAX_AHEAD days ahead of the
+        lane's next roll day. Otherwise roll what is ready and wait (<= 15 min), else False."""
+        waited = 0
+        while True:
+            if self.dry:
+                return True
+            self.refresh_status()
+            ahead = (self.next_roll_day(lane) - d).days
+            if ahead < self.max_ahead:
+                return True
+            self.roll_ready([lane])
+            if (self.next_roll_day(lane) - d).days < self.max_ahead:
+                return True
+            if waited >= 900 or minutes_to_forbidden() < 5:
+                nr = self.next_roll_day(lane)
+                self.note(f"{lane} roll is held at {nr} (fail count {self.fails(lane, nr)}); {d} would be "
+                          f"{ahead} days ahead (cap {self.max_ahead}) - lane stops ingesting this run")
+                return False
+            time.sleep(45 + random.random() * 30)
+            waited += 60
+
     def run_shard(self):
         lane = self.lane
         cfg = LANES[lane]
@@ -517,7 +590,9 @@ class Driver:
         time.sleep(self.shard * 7 + random.random() * 5)          # stagger the shards' upstream hits
         if lane == "OBS" and self.shard == 0 and "NCEI" in self.lanes:
             self.ncei()
-        for d in days:
+        queue = list(days)
+        while queue:
+            d = queue.pop(0)
             if (now() - self.started).total_seconds() > self.budget_s:
                 self.note("time budget used up"); break
             if minutes_to_forbidden() < cfg["per_day"] + 3:
@@ -533,6 +608,8 @@ class Driver:
                     break
                 if self.ready(lane, d) or (self.cursor(lane) and d >= self.cursor(lane)):
                     continue
+                if not self.wait_for_roll(lane, d):
+                    break
             extra = None
             if lane == "OBS":
                 extra = {"TASKS": "dailies,peaks" if d >= LSR_EXISTS_FROM else "dailies,peaks,lsr"}
@@ -542,20 +619,97 @@ class Driver:
                                "feed": self.summarize_feed(res)})
             if not ok:
                 k = self.fails(lane, d) + 1
-                self.error(f"{lane} {d}: {why} (failed run {k} of 3 for this day)")
+                self.error(f"{lane} {d}: {why} (attempt {k} of 3 for this day)")
                 if not self.dry:
                     self.set_key(f"p5_fail_{lane.lower()}_{d}", str(k))
+                    self.set_key(f"p5_issue_{lane.lower()}_{d}", json.dumps(
+                        {"why": why[:300], "attempts": k, "run": self.run_id, "at": now().isoformat()[:16]}))
                     if k >= 3:
-                        self.disable(f"{lane} {d} failed 3 runs: {why[:200]}")
+                        self.disable(f"{lane} {d} failed 3 times: {why[:200]}")
+                        break
+                    if d == self.next_roll_day(lane):        # the lane's roll blocker: retry it in this run
+                        w = 120 + random.random() * 60
+                        self.note(f"{d} blocks the {lane} roll - retrying in {w:.0f}s")
+                        time.sleep(w)
+                        queue.insert(0, d)
                 continue
             self.set_key(f"p5_ready_{lane.lower()}_{d}", "ok")
+            if not self.dry and self.keys().get(f"p5_fail_{lane.lower()}_{d}"):
+                self.set_key(f"p5_issue_{lane.lower()}_{d}", json.dumps(
+                    {"why": "resolved", "attempts": self.fails(lane, d), "run": self.run_id, "at": now().isoformat()[:16]}))
             retries = (res or {}).get("write_retries") or 0
             if retries:
                 w = min(300, 30 * retries) + random.random() * 30
                 self.note(f"{retries} write retries (DB pressure) - pausing {w:.0f}s")
                 time.sleep(w)
-            if self.shard == 0 and not self.dry:
+            if not self.dry:
                 self.roll_ready([lane])
+
+    # ------------------------------------------------------------ progress
+    def svc_get(self, path):
+        if not self.service:
+            return None
+        hdr = {"apikey": self.service}
+        if not self.service.startswith("sb_"):
+            hdr["Authorization"] = f"Bearer {self.service}"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{self.base}/rest/v1/{path}", headers=hdr),
+                                        timeout=60) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            return None
+
+    def progress(self):
+        """Per-lane status (no secrets): rolled-through, remaining, raw in flight, issues, rate, ETA."""
+        self.refresh_status()
+        since = (now() - dt.timedelta(hours=2)).isoformat()
+        log = self.svc_get(f"hz_backfill_log?select=lane,src,day,status,exact,run_at&run_at=gte.{since}") or []
+        keys = self.keys()
+        out = {"at": now().isoformat()[:16] + "Z", "db_gb": round(self.status["db_bytes"] / 2**30, 2),
+               "active": self.status["active"], "lanes": {}}
+        for lane in LANE_ORDER:
+            cur = self.cursor(lane)
+            nxt = self.next_roll_day(lane)
+            remaining = max(0, (nxt - FLOOR).days + 1)
+            done = (LANES[lane]["ceil"] - nxt).days
+            inflight = sum(1 for k, v in keys.items() if k.startswith(f"p5_ready_{lane.lower()}_") and v == "ok"
+                           and dt.date.fromisoformat(k[-10:]) <= nxt)
+            issues = []
+            for k, v in keys.items():
+                if k.startswith(f"p5_issue_{lane.lower()}_") and v:
+                    day = dt.date.fromisoformat(k[-10:])
+                    try:
+                        info = json.loads(v)
+                    except ValueError:
+                        info = {"why": v}
+                    info["status"] = "resolved (rolled)" if day > nxt else info.get("why") == "resolved" and \
+                        "resolved (ingested)" or "OPEN"
+                    issues.append({"day": str(day), **info})
+            rolled2h = [r for r in log if r.get("lane") == lane and r.get("status") in ("rolled", "rolled_warn", "obs_ok")
+                        and r.get("src") in (LANES[lane]["srcs"][:1] or [None])]
+            nonexact = [r for r in log if r.get("lane") == lane and r.get("status") in ("rolled", "rolled_warn")
+                        and r.get("exact") is not True]
+            rate = len(rolled2h) / 2.0
+            out["lanes"][lane] = {"rolled_through": str(cur) if cur else None, "next": str(nxt), "done": done,
+                                  "remaining": remaining, "raw_in_flight_days": inflight,
+                                  "rolled_per_hour_2h": rate, "eta_h": round(remaining / rate, 1) if rate else None,
+                                  "non_exact_2h": len(nonexact), "issues": sorted(issues, key=lambda x: x["day"])}
+        c = keys.get("p5_ncei")
+        out["ncei_done_through"] = c[:4] if c else None
+        with open(os.path.join(self.sdir, "progress.json"), "w") as fh:
+            json.dump(out, fh, indent=1)
+        sp = os.environ.get("GITHUB_STEP_SUMMARY")
+        if sp:
+            with open(sp, "a") as fh:
+                fh.write(f"### Stage 5 progress {out['at']} - DB {out['db_gb']} GB, {out['active']} active backends, "
+                         f"NCEI through {out['ncei_done_through']}\n\n| lane | rolled through | done | remaining | "
+                         f"raw in flight (days) | rolled/h (2h) | ETA h | non-exact | open issues |\n|---|---|---|---|---|---|---|---|---|\n")
+                for lane, x in out["lanes"].items():
+                    op = [f"{i['day']}: {str(i.get('why'))[:80]} (x{i.get('attempts')})" for i in x["issues"] if i["status"] == "OPEN"]
+                    fh.write(f"| {lane} | {x['rolled_through']} | {x['done']} | {x['remaining']} | {x['raw_in_flight_days']} | "
+                             f"{x['rolled_per_hour_2h']} | {x['eta_h']} | {x['non_exact_2h']} | {'; '.join(op) or '-'} |\n")
+        print("STAGE5_PROGRESS " + json.dumps(out, separators=(",", ":")), flush=True)
+        return out
 
     # ------------------------------------------------------------ main
     def main(self):
@@ -588,6 +742,10 @@ class Driver:
                 self.note(f"feed workflows active: {busy or 'none'}")
             except Exception as e:
                 self.note(f"busy check failed: {e}")
+            try:
+                self.progress()
+            except Exception as e:
+                self.note(f"progress unavailable: {e}")
             include, why = self.plan()
             self.note(f"plan: {len(include)} shard job(s) ({why})")
             mat = json.dumps({"include": include or [{"lane": "NONE", "shard": 0, "days": ""}]})
@@ -612,6 +770,7 @@ class Driver:
                 return 0
             n = self.roll_ready([l for l in LANE_ORDER if l in self.lanes])
             self.note(f"rolled {n} day(s)")
+            self.progress()
             return 1 if self.errors else 0
         raise RuntimeError(f"unknown MODE {self.mode}")
 

@@ -33,6 +33,8 @@ env:
   MAX_DB_GB: "20"
   MAX_ACTIVE: "14"
   LOOKAHEAD: "150"
+  MAX_AHEAD: "12"
+  PAUSE_DB_GB: "17"
 jobs:
   plan:
     runs-on: ubuntu-24.04
