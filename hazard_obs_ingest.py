@@ -66,6 +66,10 @@ additive tables (migration 20261007150000_phase5_v4_obs.sql in the site repo):
     as in v3).
 
 Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
+GUST QC (owner 2026-10-13): after dailies/peaks/lsr, station_gust_qc.py moves new sensor-fault
+station gusts (validated v5.2 rule) to hz_gust_quarantine. Scheduled runs: yesterday + 2 days back;
+explicit dates only with GUST_QC=1; GUST_QC=0 = off. Failures only warn.
+
 Task selection: TASKS=stations,dailies,peaks,lsr,ncei,hurdat (default: dailies,peaks,lsr)
 DAY_CONVENTION=v3|v4 (default v3)
   DAILIES/LSR/PEAKS:  DATE / INGEST_DATE  (default yesterday UTC)
@@ -79,6 +83,7 @@ from zoneinfo import ZoneInfo
 
 import clearstep
 import feedguard as fg
+import station_gust_qc
 import tzwin
 
 UA = {"User-Agent": "StormAuditor-HazardEngine/1.0"}
@@ -744,6 +749,11 @@ def main(run):
                     task_lsr(run, d0, d1, v4)
                 except Exception as e:
                     run.error(f"{d0}", "lsr", f"{type(e).__name__}: {e}")
+        if any(t in tasks for t in ("dailies", "peaks")) and station_gust_qc.enabled(explicit is not None):
+            try:   # sensor-fault gust check (station_gust_qc.py): an add-on, never fails the ingest
+                station_gust_qc.run_qc(run, dates, explicit is not None)
+            except Exception as e:
+                run.warn(station_gust_qc.QC_KEY, f"station gust QC did not complete: {type(e).__name__}: {e}")
     if "ncei" in tasks:
         years = [y.strip() for y in (os.environ.get("NCEI_YEARS") or
                                      str(dt.date.today().year)).split(",") if y.strip()]
