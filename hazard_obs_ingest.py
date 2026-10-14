@@ -84,6 +84,7 @@ from zoneinfo import ZoneInfo
 import clearstep
 import feedguard as fg
 import station_gust_qc
+import station_gust_ab
 import tzwin
 
 UA = {"User-Agent": "StormAuditor-HazardEngine/1.0"}
@@ -754,6 +755,10 @@ def main(run):
                 station_gust_qc.run_qc(run, dates, explicit is not None)
             except Exception as e:
                 run.warn(station_gust_qc.QC_KEY, f"station gust QC did not complete: {type(e).__name__}: {e}")
+            try:   # rules A/B (station_gust_ab.py, owner 2026-10-14): same window, also never fails the ingest
+                station_gust_ab.run_ab(run, dates, explicit is not None)
+            except Exception as e:
+                run.warn(station_gust_ab.QC_KEY, f"station gust rules A/B did not complete: {type(e).__name__}: {e}")
     if "ncei" in tasks:
         years = [y.strip() for y in (os.environ.get("NCEI_YEARS") or
                                      str(dt.date.today().year)).split(",") if y.strip()]
